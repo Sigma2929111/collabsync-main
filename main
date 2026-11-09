@@ -1,0 +1,2517 @@
+--!strict
+--==================================================================
+-- CollabSync Plugin v5.4 — server1 roles, synced markers, crown & mesh fixes
+--==================================================================
+local HttpService   = game:GetService("HttpService")
+local ChangeHistory = game:GetService("ChangeHistoryService")
+local StudioService = game:GetService("StudioService")
+local Players       = game:GetService("Players")
+local CoreGui       = game:GetService("CoreGui")
+local UIS           = game:GetService("UserInputService")
+local RunService    = game:GetService("RunService")
+local InsertService = game:GetService("InsertService")
+local ServerStorage = game:GetService("ServerStorage")
+
+local Selection = nil
+pcall(function() Selection = game:GetService("Selection") end)
+local PLUGIN = nil
+pcall(function() PLUGIN = plugin end)
+
+local CATALOG_URL = "http://147.135.213.131:20231"
+local DEFAULT_HOST_URL = "http://147.135.213.131:20231"
+local HEARTBEAT_INTERVAL = 10
+local CATALOG_POLL = 15
+local WS_TIMEOUT = 30
+local RECONNECT_DELAY = 5
+local APPLY_CHUNK = 200
+local APPLY_CHUNK_DELAY = 0.03
+local SYNC_TIMEOUT = 5
+local COLLABSYNC_ASSET_ID = 131612069520549
+
+local settings = {showAvatars=true, showNotifications=true, autoReconnect=true, cacheUrl=true, isDark=true}
+
+local MY_ID = 0
+pcall(function() MY_ID = StudioService:GetUserId() end)
+if MY_ID == 0 then MY_ID = math.random(1000000, 9999999) end
+local MY_NAME = "User"
+if MY_ID > 0 then pcall(function() MY_NAME = Players:GetNameFromUserIdAsync(MY_ID) end) end
+
+--==================================================================
+-- Forward Declarations
+--==================================================================
+local Main, S, InPlace, minimizedBtn, LogsWindow, root, meNameLbl
+local currentLobby, currentWhitelistScope, isOwnLobby
+local watchInstance, createLocalMarker, updateLocalMarker, destroyLocalMarker
+local applyDelta, onSelectionChanged, protectMarker
+local kickPlayer, refreshPlayerList, refreshPerms, refreshWhitelist
+local formatName, sphereName, nameColor, sphereColor, applyNameStyle, applySphereStyle
+local resolveName, isTester, isBomb, isOwner, isTrash, isLobbyHost
+local refreshMarkerStyle, setupMarkerRotation, updateMarkerRotation
+local connectWebSocket, startHeartbeat, stopSession, exitLobbyUI
+local attemptJoin, card, publishLobby, directConnect, startCatalogPoll
+local processPendingMarkers
+
+local MY_ROLES = {isOwner=false, isTester=false, isBomb=false, isTrash=false, isBanned=false}
+local roleCache = {}
+local roleFetchInFlight = {}
+local markerLocks = {}
+
+local State = {
+    session=nil, wsClient=nil, remoteLobbies={}, remotePlayers={},
+    heartbeatThread=nil, catalogPollThread=nil, applyingRemote={},
+    watched={}, connected=false, connecting=false, reconnectTask=nil,
+    myPlace={whitelist={}, hostId=MY_ID},
+    nameCache={[MY_ID]=MY_NAME}, scriptCache={}, partThrottle={},
+    objectMap={}, localMarkers={}, lastCamSend=0, lastCamPos=CFrame.new(),
+    lastAck=tick(), selectionMap={}, logs={}, applyingSnapshot=false,
+    joinSnapshot=nil, lastPosCheck={}, blacklist={}, kickInProgress={},
+    animGradients={}, pendingChunks={}, isReconnect=false,
+    markerLocalOffsets={}, markerRotations={}, synced=false,
+}
+
+local function logMsg(scope, level, text)
+    local entry = {scope=scope, level=level, text=tostring(text), time=os.date("%H:%M:%S")}
+    table.insert(State.logs, entry)
+    if #State.logs > 500 then table.remove(State.logs, 1) end
+    local prefix = "[CollabSync]"
+    if scope == "lobby" then prefix = prefix .. " [Lobby]" end
+    if level == "error" or level == "warn" then warn(prefix.." "..text) else print(prefix.." "..text) end
+    if _G.__collabsync_update_logs then pcall(_G.__collabsync_update_logs) end
+end
+logMsg("plugin", "info", "MY_ID="..tostring(MY_ID).." NAME="..MY_NAME)
+
+--==================================================================
+-- Server1 role fetch (source of truth for roles)
+--==================================================================
+local function fetchRoles(uid, name, cb)
+    task.spawn(function()
+        local url = CATALOG_URL.."/api/user/roles?userId="..tostring(uid or "").."&userName="..HttpService:UrlEncode(tostring(name or ""))
+        local ok, res = pcall(function()
+            return HttpService:RequestAsync({Url=url, Method="GET", Headers={["Content-Type"]="application/json"}})
+        end)
+        local decoded = nil
+        if ok and res and res.Success then
+            local dok, dres = pcall(function() return HttpService:JSONDecode(res.Body) end)
+            if dok and type(dres) == "table" then decoded = dres end
+        end
+        if cb then pcall(cb, decoded) end
+    end)
+end
+
+-- Fetch MY roles on init (before lobby join), refresh UI when arrived
+fetchRoles(MY_ID, MY_NAME, function(r)
+    if r then
+        MY_ROLES.isOwner = r.isOwner or false
+        MY_ROLES.isTester = r.isTester or false
+        MY_ROLES.isBomb = r.isBomb or false
+        MY_ROLES.isTrash = r.isTrash or false
+        MY_ROLES.isBanned = r.isBanned or false
+        logMsg("plugin", "info", "MY_ROLES from server1: owner="..tostring(MY_ROLES.isOwner).." tester="..tostring(MY_ROLES.isTester).." banned="..tostring(MY_ROLES.isBanned))
+        if _G.__collabsync_refresh_styles then pcall(_G.__collabsync_refresh_styles) end
+    end
+end)
+
+if PLUGIN and MY_ROLES.isOwner then
+    pcall(function()
+        local json = PLUGIN:GetSetting("cs_blacklist")
+        if json and json ~= "" then
+            local ok, decoded = pcall(function() return HttpService:JSONDecode(json) end)
+            if ok and type(decoded) == "table" then State.blacklist = decoded end
+        end
+    end)
+end
+local function saveBlacklist()
+    if PLUGIN and MY_ROLES.isOwner then
+        pcall(function() PLUGIN:SetSetting("cs_blacklist", HttpService:JSONEncode(State.blacklist)) end)
+    end
+end
+local function isBlacklisted(uid, name)
+    if not MY_ROLES.isOwner then return false end
+    return State.blacklist[tostring(uid)] or State.blacklist[name]
+end
+
+--==================================================================
+-- UI Helpers
+--==================================================================
+local T = {
+    bg=Color3.fromRGB(22,22,26), surface=Color3.fromRGB(32,32,38),
+    surf2=Color3.fromRGB(42,42,50), surf3=Color3.fromRGB(54,54,64),
+    border=Color3.fromRGB(62,62,74), accent=Color3.fromRGB(88,132,255),
+    accent2=Color3.fromRGB(112,154,255), text=Color3.fromRGB(238,238,242),
+    muted=Color3.fromRGB(150,150,165), success=Color3.fromRGB(76,200,120),
+    danger=Color3.fromRGB(230,90,90), warn=Color3.fromRGB(240,180,60),
+    gold=Color3.fromRGB(255,215,0), tester=Color3.fromRGB(100,170,255),
+    bomb=Color3.fromRGB(15,15,15), trash=Color3.fromRGB(101,67,33),
+    owner=Color3.fromRGB(255,100,255),
+}
+
+local function I(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props or {}) do if k ~= "Parent" then o[k] = v end end
+    if parent then o.Parent = parent end
+    return o
+end
+local function round(p, r) return I("UICorner", {CornerRadius=UDim.new(0,r or 8)}, p) end
+local function outline(p, c, t) return I("UIStroke", {Color=c or T.border, Thickness=t or 1, ApplyStrokeMode=Enum.ApplyStrokeMode.Border}, p) end
+local function pad(p, v, h) h=h or v; return I("UIPadding", {PaddingTop=UDim.new(0,v), PaddingBottom=UDim.new(0,v), PaddingLeft=UDim.new(0,h), PaddingRight=UDim.new(0,h)}, p) end
+local function lbl(parent, text, props)
+    props = props or {}
+    local hasBg = props.bg ~= nil
+    return I("TextLabel", {
+        Text=text, Font=props.font or Enum.Font.Gotham, TextSize=props.textSize or 14,
+        TextColor3=props.color or T.text, BackgroundColor3=props.bg or T.surface,
+        BackgroundTransparency=hasBg and 0 or 1, BorderSizePixel=0,
+        TextXAlignment=props.xAlign or Enum.TextXAlignment.Left,
+        TextYAlignment=props.yAlign or Enum.TextYAlignment.Center,
+        TextTruncate=props.truncate and Enum.TextTruncate.AtEnd or Enum.TextTruncate.None,
+        Size=props.size or UDim2.fromScale(1,1), Position=props.pos, AnchorPoint=props.anchor,
+        RichText=props.rich or false, ZIndex=props.zIndex or 1, TextWrapped=props.wrapped or false,
+        AutomaticSize=props.autoSize or Enum.AutomaticSize.None,
+    }, parent)
+end
+local function btn(parent, text, props)
+    props = props or {}
+    local b = I("TextButton", {
+        Text=text, Font=props.font or Enum.Font.GothamMedium, TextSize=props.textSize or 14,
+        TextColor3=props.color or T.text, BackgroundColor3=props.bg or T.surf2,
+        BackgroundTransparency=props.transparent and 1 or 0, AutoButtonColor=false, BorderSizePixel=0,
+        TextXAlignment=Enum.TextXAlignment.Center, Size=props.size or UDim2.fromOffset(120,34),
+        Position=props.pos, AnchorPoint=props.anchor, ZIndex=props.zIndex or 1,
+    }, parent)
+    round(b, props.corner or 8)
+    if props.outline then outline(b, props.outline, 1) end
+    local baseBg, baseTr = b.BackgroundColor3, b.BackgroundTransparency
+    b.MouseEnter:Connect(function()
+        if props.transparent then b.BackgroundTransparency = 0.85
+        else b.BackgroundColor3 = props.hoverBg or T.accent end
+    end)
+    b.MouseLeave:Connect(function()
+        b.BackgroundColor3 = baseBg; b.BackgroundTransparency = baseTr
+    end)
+    return b
+end
+
+local thumbCache = {}
+local function getThumbAsync(uid)
+    if thumbCache[uid] then return thumbCache[uid] end
+    local ok, url = pcall(function() return Players:GetUserThumbnailAsync(uid, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size150x150) end)
+    if ok and url then thumbCache[uid] = url; return url end
+    return "rbxthumb://type=AvatarHeadShot&id="..uid.."&w=150&h=150"
+end
+local function avatar(parent, size, uid)
+    if not settings.showAvatars then return I("Frame", {Size=UDim2.fromOffset(size or 26, size or 26), BackgroundTransparency=1}, parent) end
+    local holder = I("Frame", {Size=UDim2.fromOffset(size or 26, size or 26), BackgroundColor3=T.surf3, BorderSizePixel=0}, parent)
+    round(holder, size or 26); outline(holder, T.bg, 2)
+    local img = I("ImageLabel", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Image=getThumbAsync(uid or 1)}, holder)
+    round(img, size or 26)
+    task.spawn(function()
+        local url = getThumbAsync(uid or 1)
+        if img.Parent then img.Image = url end
+    end)
+    return holder
+end
+
+local function makeDraggable(frame, dragArea)
+    local dragging, startPos, startInput = false, nil, nil
+    dragArea.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true; startPos = frame.Position; startInput = input.Position
+            input.Changed:Connect(function() if input.UserInputState == Enum.UserInputState.End then dragging = false end end)
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            local d = input.Position - startInput
+            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+end
+local function showToast(parent, text, color)
+    if not settings.showNotifications and color ~= T.danger then return end
+    if not parent then return end
+    local t = I("TextLabel", {Text=text, Font=Enum.Font.GothamMedium, TextSize=13, TextColor3=Color3.new(1,1,1),
+        BackgroundColor3=color or T.accent, BorderSizePixel=0, Size=UDim2.fromOffset(360,40),
+        Position=UDim2.new(0.5,-180,1,-70), ZIndex=90}, parent)
+    round(t, 8); outline(t, color or T.accent, 1)
+    task.delay(4, function() if t and t.Parent then t:Destroy() end end)
+end
+local function applyTheme(isDark)
+    local nb, ns = isDark and Color3.fromRGB(22,22,26) or Color3.fromRGB(240,240,245),
+                    isDark and Color3.fromRGB(32,32,38) or Color3.fromRGB(255,255,255)
+    local ns2, ns3 = isDark and Color3.fromRGB(42,42,50) or Color3.fromRGB(230,230,235),
+                     isDark and Color3.fromRGB(54,54,64) or Color3.fromRGB(210,210,215)
+    local nt, nm = isDark and Color3.fromRGB(238,238,242) or Color3.fromRGB(30,30,35),
+                   isDark and Color3.fromRGB(150,150,165) or Color3.fromRGB(100,100,110)
+    local ob, os, os2, os3, ot, om = T.bg, T.surface, T.surf2, T.surf3, T.text, T.muted
+    T.bg, T.surface, T.surf2, T.surf3, T.text, T.muted = nb, ns, ns2, ns3, nt, nm
+    if not root then return end
+    for _, v in ipairs(root:GetDescendants()) do
+        if v:IsA("Frame") or v:IsA("TextButton") or v:IsA("TextBox") then
+            if v.BackgroundColor3 == ob then v.BackgroundColor3 = nb end
+            if v.BackgroundColor3 == os then v.BackgroundColor3 = ns end
+            if v.BackgroundColor3 == os2 then v.BackgroundColor3 = ns2 end
+            if v.BackgroundColor3 == os3 then v.BackgroundColor3 = ns3 end
+        end
+        if v:IsA("TextLabel") or v:IsA("TextButton") or v:IsA("TextBox") then
+            if v.TextColor3 == ot then v.TextColor3 = nt end
+            if v.TextColor3 == om then v.TextColor3 = nm end
+        end
+        if v:IsA("UIStroke") and v.Color == T.border then v.Color = isDark and Color3.fromRGB(62,62,74) or Color3.fromRGB(200,200,205) end
+    end
+end
+local function httpJson(url, method, body, headers)
+    local opts = {Url=url, Method=method or "GET", Headers=headers or {["Content-Type"]="application/json"}}
+    if body then opts.Body = HttpService:JSONEncode(body) end
+    for attempt = 1, 3 do
+        local ok, res = pcall(function() return HttpService:RequestAsync(opts) end)
+        if not ok then
+            if attempt < 3 then task.wait(5) else return false, "Сеть: "..tostring(res), 0 end
+        elseif res.Success then
+            local dok, dres = pcall(function() return HttpService:JSONDecode(res.Body) end)
+            return true, (dok and dres) or res.Body, res.StatusCode
+        else
+            if res.StatusCode >= 500 and attempt < 3 then task.wait(5)
+            else
+                local dok, dres = pcall(function() return HttpService:JSONDecode(res.Body) end)
+                return false, (dok and dres) or {error="HTTP "..res.StatusCode}, res.StatusCode
+            end
+        end
+    end
+    return false, "Таймаут сервера", 0
+end
+
+resolveName = function(uid)
+    if not uid or uid == 0 then return "—" end
+    if uid == MY_ID then return MY_NAME end
+    if State.nameCache[uid] then return State.nameCache[uid] end
+    pcall(function() local n = Players:GetNameFromUserIdAsync(uid); State.nameCache[uid] = n end)
+    return State.nameCache[uid] or ("User "..uid)
+end
+getRoles = function(uid)
+    if uid == MY_ID then return MY_ROLES end
+    -- Prefer roles supplied via WS (which now come from server1 on the client's own init)
+    for _, p in ipairs(State.remotePlayers or {}) do
+        if p.userId == uid and p.roles and (p.roles.isOwner or p.roles.isTester or p.roles.isBomb or p.roles.isTrash) then
+            return p.roles
+        end
+    end
+    if roleCache[uid] then return roleCache[uid] end
+    -- Lazy fetch from server1
+    if not roleFetchInFlight[uid] then
+        roleFetchInFlight[uid] = true
+        fetchRoles(uid, nil, function(r)
+            roleFetchInFlight[uid] = nil
+            if r then
+                roleCache[uid] = r
+                if _G.__collabsync_refresh_styles then pcall(_G.__collabsync_refresh_styles) end
+            end
+        end)
+    end
+    return {isOwner=false, isTester=false, isBomb=false, isTrash=false}
+end
+isTester = function(uid) local r = getRoles(uid); return r and r.isTester or false end
+isBomb = function(uid) local r = getRoles(uid); return r and r.isBomb or false end
+isOwner = function(uid) local r = getRoles(uid); return r and r.isOwner or false end
+isTrash = function(uid) local r = getRoles(uid); return r and r.isTrash or false end
+isLobbyHost = function(uid) return currentLobby and currentLobby.hostId == uid end
+
+nameColor = function(uid)
+    if not uid then return T.text end
+    if isOwner(uid) then return T.owner end
+    if isLobbyHost(uid) then return T.gold end
+    if isTester(uid) then return T.tester end
+    if isTrash(uid) then return T.trash end
+    if isBomb(uid) then return T.bomb end
+    return T.text
+end
+sphereColor = function(uid)
+    if not uid then return T.text end
+    if isLobbyHost(uid) then return T.gold end
+    if isTester(uid) then return T.tester end
+    if isTrash(uid) then return T.trash end
+    if isBomb(uid) then return T.bomb end
+    if isOwner(uid) then return T.owner end
+    return Color3.fromRGB((uid*17)%150+100, (uid*31)%150+100, (uid*53)%150+100)
+end
+
+formatName = function(uid)
+    local base = resolveName(uid)
+    local prefix, suffix = "", ""
+    if isTrash(uid) then prefix = "🗑️ " end
+    if isLobbyHost(uid) then prefix = "👑 " .. prefix end
+    if isOwner(uid) then prefix = "⭐ " .. prefix end
+    if isTester(uid) then prefix = "🧪 " .. prefix end
+    if isBomb(uid) then suffix = " 💣" end
+    return prefix..base..suffix
+end
+
+sphereName = function(uid)
+    return resolveName(uid)
+end
+
+local function startGradientAnimator()
+    task.spawn(function()
+        while true do
+            task.wait(0.05)
+            for i = #State.animGradients, 1, -1 do
+                local e = State.animGradients[i]
+                if not e.label or not e.label.Parent or not e.grad then
+                    table.remove(State.animGradients, i)
+                else
+                    e.grad.Rotation = (e.grad.Rotation + 10) % 360
+                end
+            end
+        end
+    end)
+end
+startGradientAnimator()
+
+applyNameStyle = function(label, uid, noEmoji)
+    if not label or not uid then return end
+    label.TextColor3 = nameColor(uid)
+    if isBomb(uid) then
+        label.TextStrokeTransparency = 0
+        label.TextStrokeColor3 = Color3.fromRGB(230, 230, 230)
+    end
+    if isTrash(uid) then
+        label.TextStrokeTransparency = 0
+        label.TextStrokeColor3 = Color3.fromRGB(60, 40, 20)
+    end
+    if isOwner(uid) then
+        local grad = Instance.new("UIGradient")
+        grad.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(255,50,50)),
+            ColorSequenceKeypoint.new(0.17, Color3.fromRGB(255,180,50)),
+            ColorSequenceKeypoint.new(0.33, Color3.fromRGB(255,255,50)),
+            ColorSequenceKeypoint.new(0.5, Color3.fromRGB(50,255,50)),
+            ColorSequenceKeypoint.new(0.66, Color3.fromRGB(50,200,255)),
+            ColorSequenceKeypoint.new(0.83, Color3.fromRGB(130,50,255)),
+            ColorSequenceKeypoint.new(1, Color3.fromRGB(255,50,150)),
+        })
+        grad.Parent = label
+        table.insert(State.animGradients, {label=label, grad=grad})
+    elseif isLobbyHost(uid) or isTester(uid) then
+        local base = nameColor(uid)
+        local brighter = Color3.fromRGB(math.min(255, base.R + 90), math.min(255, base.G + 90), math.min(255, base.B + 90))
+        local grad = Instance.new("UIGradient")
+        grad.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, base),
+            ColorSequenceKeypoint.new(0.5, brighter),
+            ColorSequenceKeypoint.new(1, base),
+        })
+        grad.Parent = label
+        table.insert(State.animGradients, {label=label, grad=grad})
+    end
+end
+
+applySphereStyle = function(label, uid)
+    if not label or not uid then return end
+    label.TextColor3 = sphereColor(uid)
+    if isOwner(uid) then
+        local grad = Instance.new("UIGradient")
+        grad.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(255,50,50)),
+            ColorSequenceKeypoint.new(0.17, Color3.fromRGB(255,180,50)),
+            ColorSequenceKeypoint.new(0.33, Color3.fromRGB(255,255,50)),
+            ColorSequenceKeypoint.new(0.5, Color3.fromRGB(50,255,50)),
+            ColorSequenceKeypoint.new(0.66, Color3.fromRGB(50,200,255)),
+            ColorSequenceKeypoint.new(0.83, Color3.fromRGB(130,50,255)),
+            ColorSequenceKeypoint.new(1, Color3.fromRGB(255,50,150)),
+        })
+        grad.Parent = label
+        table.insert(State.animGradients, {label=label, grad=grad})
+    end
+end
+
+local function lookupUser(query)
+    if not query or query == "" then return nil end
+    local uid = tonumber(query)
+    if uid then return {uid=uid, name=resolveName(uid)} end
+    local ok, result = pcall(function() return Players:GetNameFromUserIdAsync(query) end)
+    if not ok or not result then return nil end
+    State.nameCache[result] = query
+    return {uid=result, name=query}
+end
+
+--==================================================================
+-- Collabsync Model + Markers
+--==================================================================
+local CollabsyncModel = nil
+local TeammateTemplate = nil
+local OwnerTeammateTemplate = nil
+
+local function ensureCollabsyncModel()
+    local existing = ServerStorage:FindFirstChild("Collabsync model")
+    if existing then
+        CollabsyncModel = existing
+        return true
+    end
+    local ok, loaded = pcall(function() return InsertService:LoadAsset(COLLABSYNC_ASSET_ID) end)
+    if not ok or not loaded then
+        logMsg("plugin", "warn", "Не удалось загрузить Collabsync model")
+        return false
+    end
+    local children = loaded:GetChildren()
+    if #children > 0 then
+        local main = children[1]
+        main.Name = "Collabsync model"
+        main.Archivable = true
+        main.Parent = ServerStorage
+        CollabsyncModel = main
+    end
+    loaded:Destroy()
+    logMsg("plugin", "info", "Collabsync model загружен")
+    return CollabsyncModel ~= nil
+end
+
+local function findTemplates()
+    if not CollabsyncModel then return end
+    local t = CollabsyncModel:FindFirstChild("Teammate")
+    local o = CollabsyncModel:FindFirstChild("OwnerTeammate")
+    if t then t.Archivable = true; TeammateTemplate = t end
+    if o then o.Archivable = true; OwnerTeammateTemplate = o end
+    logMsg("plugin", "info", "Templates: Teammate="..tostring(TeammateTemplate ~= nil).." Owner="..tostring(OwnerTeammateTemplate ~= nil))
+end
+task.spawn(function()
+    if ensureCollabsyncModel() then findTemplates() end
+end)
+
+local function setMarkerRootCF(marker, cf)
+    if marker:IsA("Model") then
+        marker:PivotTo(cf)
+    elseif marker:IsA("BasePart") then
+        marker.CFrame = cf
+    end
+end
+
+local function computeMarkerOffsets(uid)
+    local marker = State.localMarkers[uid]
+    if not marker or not marker.Parent then return end
+    local rootCF = marker:IsA("Model") and marker:GetPivot() or marker.CFrame
+    local offsets = {}
+    for _, desc in ipairs(marker:GetDescendants()) do
+        if desc:IsA("BasePart") and desc ~= marker then
+            offsets[desc] = rootCF:ToObjectSpace(desc.CFrame)
+        end
+    end
+    State.markerLocalOffsets[uid] = offsets
+end
+
+local function buildFallbackMarker(uid)
+    local m = Instance.new("Part")
+    m.Name = "_CS_Marker_"..uid
+    m.Shape = Enum.PartType.Ball
+    m.Size = Vector3.new(1.2, 1.2, 1.2)
+    m.Transparency = 0.4
+    m.Anchored = true
+    m.CanCollide = false; m.CanQuery = false; m.CanTouch = false
+    m.Locked = true
+    m.Material = Enum.Material.Neon
+    m.Color = sphereColor(uid)
+    m:SetAttribute("_CS_Skip", true)
+    local bb = Instance.new("BillboardGui")
+    bb.Size = UDim2.new(0, 200, 0, 40)
+    bb.StudsOffset = Vector3.new(0, 1.2, 0)
+    bb.AlwaysOnTop = true
+    bb:SetAttribute("_CS_Skip", true); bb.Parent = m
+    local tl = Instance.new("TextLabel")
+    tl.Size = UDim2.fromScale(1,1)
+    tl.BackgroundTransparency = 1
+    tl.Font = Enum.Font.GothamBold
+    tl.TextScaled = true
+    tl.Text = sphereName(uid)
+    tl:SetAttribute("_CS_Skip", true); tl.Parent = bb
+    applySphereStyle(tl, uid)
+    return m
+end
+
+setupMarkerRotation = function(marker, uid)
+    local handle = nil
+    local group = {}
+    for _, desc in ipairs(marker:GetDescendants()) do
+        if desc:IsA("BasePart") then
+            if desc.Name == "Handle" then 
+                handle = desc
+            elseif desc.Name == "Liquid" or desc.Name == "Union" or desc.Name == "MeshPart" then
+                table.insert(group, desc)
+            end
+        end
+    end
+    local rootCF = marker:IsA("Model") and marker:GetPivot() or marker.CFrame
+    local data = { startTime = tick() }
+    
+    if handle then
+        data.handle = handle
+        data.handleLocal = rootCF:ToObjectSpace(handle.CFrame)
+    end
+    if #group > 0 then
+        local centerSum = Vector3.new()
+        local locals = {}
+        for _, p in ipairs(group) do
+            local lcf = rootCF:ToObjectSpace(p.CFrame)
+            centerSum = centerSum + lcf.Position
+            table.insert(locals, {part=p, localCF=lcf})
+        end
+        data.groupCenter = centerSum / #group
+        data.group = locals
+    end
+    State.markerRotations[uid] = data
+end
+
+updateMarkerRotation = function(uid, rootCF)
+    local data = State.markerRotations[uid]
+    if not data then return end
+    local t = (tick() - data.startTime) * 1.8
+    
+    if data.handle and data.handle.Parent then
+        State.applyingRemote[data.handle] = true
+        pcall(function()
+            data.handle.CFrame = rootCF * data.handleLocal * CFrame.Angles(0, t, 0)
+        end)
+        task.delay(0.02, function() State.applyingRemote[data.handle] = nil end)
+    end
+    
+    if data.group then
+        local c = data.groupCenter
+        for _, entry in ipairs(data.group) do
+            if entry.part and entry.part.Parent then
+                State.applyingRemote[entry.part] = true
+                pcall(function()
+                    local pivot = CFrame.new(c) * CFrame.Angles(0, t, 0) * CFrame.new(-c)
+                    entry.part.CFrame = rootCF * pivot * entry.localCF
+                end)
+                task.delay(0.02, function() State.applyingRemote[entry.part] = nil end)
+            end
+        end
+    end
+end
+
+protectMarker = function(marker, uid)
+    local origName = marker.Name
+    marker:SetAttribute("_CS_OrigName", origName)
+    marker:GetPropertyChangedSignal("Name"):Connect(function()
+        if not State.applyingRemote[marker] and marker.Name ~= origName then
+            marker.Name = origName
+        end
+    end)
+    for _, desc in ipairs(marker:GetDescendants()) do
+        if desc:IsA("TextLabel") then
+            local origText = desc.Text
+            local origColor = desc.TextColor3
+            desc:SetAttribute("_CS_OrigText", origText)
+            desc:GetPropertyChangedSignal("Text"):Connect(function()
+                if not State.applyingRemote[desc] and desc.Text ~= origText then
+                    desc.Text = origText
+                end
+            end)
+            desc:GetPropertyChangedSignal("TextColor3"):Connect(function()
+                if not State.applyingRemote[desc] then
+                    desc.TextColor3 = origColor
+                end
+            end)
+        elseif desc:IsA("BasePart") then
+            local origSize = desc.Size
+            local origColor = desc.Color
+            desc:GetPropertyChangedSignal("Size"):Connect(function()
+                if not State.applyingRemote[desc] then desc.Size = origSize end
+            end)
+            desc:GetPropertyChangedSignal("Color"):Connect(function()
+                if not State.applyingRemote[desc] then desc.Color = origColor end
+            end)
+        end
+    end
+end
+
+local function findCrownSource(t)
+    if not t then return nil end
+    return t:FindFirstChild("Crown", true)
+end
+
+refreshMarkerStyle = function(uid)
+    local marker = State.localMarkers[uid]
+    if not marker or not marker.Parent then return end
+    local col = sphereColor(uid)
+    
+    for _, desc in ipairs(marker:GetDescendants()) do
+        if desc:IsA("BasePart") then
+            State.applyingRemote[desc] = true
+            pcall(function() desc.Color = col end)
+            task.delay(0.05, function() State.applyingRemote[desc] = nil end)
+        elseif desc:IsA("SphereHandleAdornment") or desc:IsA("ConeHandleAdornment") or desc:IsA("CylinderHandleAdornment") then
+            pcall(function() desc.Color3 = col end)
+        elseif desc:IsA("TextLabel") then
+            State.applyingRemote[desc] = true
+            pcall(function()
+                desc.Text = sphereName(uid)
+                desc.TextColor3 = col
+            end)
+            task.delay(0.05, function() State.applyingRemote[desc] = nil end)
+        end
+    end
+    
+    -- === Crown logic (fixed) ===
+    local crown = marker:FindFirstChild("Crown", true)
+    if crown and not isLobbyHost(uid) then
+        pcall(function() crown:Destroy() end)
+    elseif not crown and isLobbyHost(uid) then
+        -- Always try own template first, then the other, then any
+        local sourceTemplates = {}
+        if isOwner(uid) then
+            table.insert(sourceTemplates, OwnerTeammateTemplate)
+            table.insert(sourceTemplates, TeammateTemplate)
+        else
+            table.insert(sourceTemplates, TeammateTemplate)
+            table.insert(sourceTemplates, OwnerTeammateTemplate)
+        end
+        local crownSrc, sourceTemplate = nil, nil
+        for _, t in ipairs(sourceTemplates) do
+            local c = findCrownSource(t)
+            if c then crownSrc = c; sourceTemplate = t; break end
+        end
+        if crownSrc and sourceTemplate then
+            local newCrown = crownSrc:Clone()
+            newCrown:SetAttribute("_CS_Skip", true)
+            -- Compute relative offset within source template, apply to current marker position
+            local sourceRootCF
+            if sourceTemplate:IsA("Model") then
+                sourceRootCF = sourceTemplate:GetPivot()
+            elseif sourceTemplate:IsA("BasePart") then
+                sourceRootCF = sourceTemplate.CFrame
+            end
+            if sourceRootCF then
+                local crownCF
+                if crownSrc:IsA("Model") then crownCF = crownSrc:GetPivot()
+                elseif crownSrc:IsA("BasePart") then crownCF = crownSrc.CFrame end
+                if crownCF then
+                    local localCF = sourceRootCF:ToObjectSpace(crownCF)
+                    local markerRootCF = marker:IsA("Model") and marker:GetPivot() or marker.CFrame
+                    local targetCF = markerRootCF * localCF
+                    if newCrown:IsA("Model") then
+                        pcall(function() newCrown:PivotTo(targetCF) end)
+                    elseif newCrown:IsA("BasePart") then
+                        pcall(function() newCrown.CFrame = targetCF end)
+                    end
+                end
+            end
+            newCrown.Parent = marker
+            -- Recompute marker offsets so crown follows on next move
+            task.defer(function()
+                if State.localMarkers[uid] == marker and marker.Parent then
+                    computeMarkerOffsets(uid)
+                end
+            end)
+            logMsg("lobby", "info", "Корона добавлена для хоста "..sphereName(uid))
+        end
+    end
+end
+
+createLocalMarker = function(uid, name)
+    if uid == MY_ID then return end
+    if State.localMarkers[uid] then return end
+    if markerLocks[uid] then return end
+    markerLocks[uid] = true
+    local ok, err = pcall(function()
+        if not TeammateTemplate and not OwnerTeammateTemplate then
+            if not ensureCollabsyncModel() then
+                State.localMarkers[uid] = buildFallbackMarker(uid)
+                State.localMarkers[uid].Parent = workspace
+                return
+            end
+            findTemplates()
+        end
+        local isOwnerUser = isOwner(uid)
+        local template = isOwnerUser and OwnerTeammateTemplate or TeammateTemplate
+        local marker = nil
+        if template then
+            local cok, cloned = pcall(function() return template:Clone() end)
+            if cok and cloned then marker = cloned end
+        end
+        if not marker then
+            marker = buildFallbackMarker(uid)
+            marker.Parent = workspace
+            State.localMarkers[uid] = marker
+            return
+        end
+        marker.Name = "_CS_Marker_"..uid
+        marker:SetAttribute("_CS_Skip", true)
+        marker.Archivable = false
+        if not isLobbyHost(uid) then
+            local crown = marker:FindFirstChild("Crown", true)
+            if crown then pcall(function() crown:Destroy() end) end
+        end
+        local col = sphereColor(uid)
+        for _, desc in ipairs(marker:GetDescendants()) do
+            desc:SetAttribute("_CS_Skip", true)
+            if desc:IsA("BasePart") then
+                pcall(function() desc.Color = col end)
+                desc.Locked = true
+                desc.Anchored = true
+                desc.CanCollide = false
+                desc.CanQuery = false
+                desc.CanTouch = false
+            elseif desc:IsA("SphereHandleAdornment") or desc:IsA("ConeHandleAdornment") or desc:IsA("CylinderHandleAdornment") then
+                pcall(function() desc.Color3 = col; desc.Transparency = 0.15; desc.AlwaysOnTop = false end)
+            elseif desc:IsA("TextLabel") then
+                desc.Text = sphereName(uid)
+                applySphereStyle(desc, uid)
+            end
+        end
+        if workspace.CurrentCamera then setMarkerRootCF(marker, workspace.CurrentCamera.CFrame) end
+        marker.Parent = workspace
+        State.localMarkers[uid] = marker
+        computeMarkerOffsets(uid)
+        if isOwnerUser then setupMarkerRotation(marker, uid) end
+        protectMarker(marker, uid)
+    end)
+    markerLocks[uid] = nil
+    if not ok then
+        logMsg("plugin", "error", "createLocalMarker("..tostring(uid).."): "..tostring(err))
+        State.localMarkers[uid] = nil
+    end
+end
+
+updateLocalMarker = function(uid, cframe)
+    local marker = State.localMarkers[uid]
+    if not marker or not marker.Parent then return end
+    State.applyingRemote[marker] = true
+    setMarkerRootCF(marker, cframe)
+    local offsets = State.markerLocalOffsets[uid]
+    if offsets then
+        for desc, offset in pairs(offsets) do
+            if desc and desc.Parent then
+                local rotData = State.markerRotations[uid]
+                local isRotPart = false
+                if rotData then
+                    if rotData.handle == desc then isRotPart = true end
+                    if rotData.group then
+                        for _, e in ipairs(rotData.group) do if e.part == desc then isRotPart = true; break end end
+                    end
+                end
+                if not isRotPart then
+                    State.applyingRemote[desc] = true
+                    pcall(function() desc.CFrame = cframe * offset end)
+                end
+            end
+        end
+    end
+    if State.markerRotations[uid] then updateMarkerRotation(uid, cframe) end
+    task.delay(0.05, function()
+        State.applyingRemote[marker] = nil
+        if offsets then for desc in pairs(offsets) do State.applyingRemote[desc] = nil end end
+    end)
+end
+
+destroyLocalMarker = function(uid)
+    local m = State.localMarkers[uid]
+    if m and typeof(m) ~= "boolean" then pcall(function() m:Destroy() end) end
+    State.localMarkers[uid] = nil
+    State.markerLocalOffsets[uid] = nil
+    State.markerRotations[uid] = nil
+    for i = #State.animGradients, 1, -1 do
+        local e = State.animGradients[i]
+        if not e.label or not e.label.Parent then table.remove(State.animGradients, i) end
+    end
+end
+
+processPendingMarkers = function()
+    if not State.synced then return end
+    if not State.connected then return end
+    for _, p in ipairs(State.remotePlayers or {}) do
+        if p.userId ~= MY_ID and not State.localMarkers[p.userId] then
+            createLocalMarker(p.userId, p.userName)
+        end
+    end
+    for uid in pairs(State.localMarkers) do
+        refreshMarkerStyle(uid)
+    end
+end
+
+--==================================================================
+-- Serialization
+--==================================================================
+local SYNC_SERVICES = {
+    game:GetService("Workspace"), game:GetService("ServerScriptService"),
+    game:GetService("ReplicatedStorage"), game:GetService("StarterPlayer"),
+    game:GetService("ServerStorage"),
+}
+
+local SKIP_CLASSES = {
+    Terrain=true, Camera=true, Sound=true,
+    UIGradient=true, UIStroke=true, UICorner=true, UIPadding=true,
+    UIListLayout=true, UIGridLayout=true, UITableLayout=true,
+    UIPageLayout=true, UIScale=true, UIAspectRatioConstraint=true,
+    UISizeConstraint=true, UIPositionConstraint=true, UITextSizeConstraint=true,
+    Highlight=true, SelectionBox=true,
+}
+
+local function shouldSkip(inst) return SKIP_CLASSES[inst.ClassName] == true end
+
+local nextId = 0
+local function generateId() nextId = nextId + 1; return tostring(os.time()).."_"..tostring(nextId).."_"..tostring(math.random(1000,9999)) end
+local function getOrSetId(inst)
+    local id = inst:GetAttribute("_CS_Id")
+    if not id then id = generateId(); inst:SetAttribute("_CS_Id", id); State.objectMap[id] = inst end
+    return id
+end
+local function hasSkipAncestor(inst)
+    local cur = inst
+    while cur and cur ~= game do
+        if cur:GetAttribute("_CS_Skip") then return true end
+        if SKIP_CLASSES[cur.ClassName] then return true end
+        cur = cur.Parent
+    end
+    return false
+end
+
+local function normalizeMeshId(s)
+    if not s or s == "" or s == "rbxassetid://0" or s == "rbxassetid://" then return nil end
+    if s:match("^%d+$") then return "rbxassetid://"..s end
+    return s
+end
+
+local function sanitizeProps(props)
+    if not props then return end
+    for _, key in ipairs({"MeshId", "TextureID", "TextureId", "Texture"}) do
+        if props[key] == "" or props[key] == "rbxassetid://0" or props[key] == "rbxassetid://" then props[key] = nil end
+    end
+    if props.MeshId then props.MeshId = normalizeMeshId(props.MeshId) end
+end
+
+local function applyProps(inst, props, attrs)
+    if not props then return end
+    if inst:IsA("MeshPart") then
+        if props.MeshId then
+            local cur = ""; pcall(function() cur = inst.MeshId end)
+            local norm = normalizeMeshId(props.MeshId) or props.MeshId
+            if cur ~= norm then pcall(function() inst.MeshId = norm end) end
+        end
+        if props.TextureID then pcall(function() inst.TextureID = normalizeMeshId(props.TextureID) or props.TextureID end) end
+    end
+    if inst:IsA("DataModelMesh") then
+        if props.MeshType and inst:IsA("SpecialMesh") then pcall(function() inst.MeshType = Enum.MeshType[props.MeshType] end) end
+        if props.MeshId then pcall(function() inst.MeshId = normalizeMeshId(props.MeshId) or props.MeshId end) end
+        if props.TextureId then pcall(function() inst.TextureId = normalizeMeshId(props.TextureId) or props.TextureId end) end
+        if props.Scale then pcall(function() inst.Scale = Vector3.new(unpack(props.Scale)) end) end
+        if props.Offset then pcall(function() inst.Offset = Vector3.new(unpack(props.Offset)) end) end
+        if props.VertexColor and inst:IsA("SpecialMesh") then pcall(function() inst.VertexColor = Vector3.new(unpack(props.VertexColor)) end) end
+    end
+    if inst:IsA("Motor6D") or inst:IsA("Weld") or inst:IsA("Snap") then
+        if props.C0 then pcall(function() inst.C0 = CFrame.new(unpack(props.C0)) end) end
+        if props.C1 then pcall(function() inst.C1 = CFrame.new(unpack(props.C1)) end) end
+        if props.Transform and inst:IsA("Motor6D") then pcall(function() inst.Transform = CFrame.new(unpack(props.Transform)) end) end
+        if props.Part0Id and State.objectMap[props.Part0Id] then pcall(function() inst.Part0 = State.objectMap[props.Part0Id] end) end
+        if props.Part1Id and State.objectMap[props.Part1Id] then pcall(function() inst.Part1 = State.objectMap[props.Part1Id] end) end
+    end
+    if inst:IsA("Humanoid") then
+        if props.Health then pcall(function() inst.Health = props.Health end) end
+        if props.MaxHealth then pcall(function() inst.MaxHealth = props.MaxHealth end) end
+        if props.WalkSpeed then pcall(function() inst.WalkSpeed = props.WalkSpeed end) end
+        if props.JumpPower then pcall(function() inst.JumpPower = props.JumpPower end) end
+        if props.HipHeight then pcall(function() inst.HipHeight = props.HipHeight end) end
+        if props.RigType then pcall(function() inst.RigType = Enum.HumanoidRigType[props.RigType] end) end
+    end
+    if inst:IsA("BasePart") then
+        if props.CFrame then pcall(function() inst.CFrame = CFrame.new(unpack(props.CFrame)) end) end
+        if props.Size then pcall(function() inst.Size = Vector3.new(unpack(props.Size)) end) end
+        if props.Color then pcall(function() inst.Color = Color3.new(unpack(props.Color)) end) end
+        if props.Transparency ~= nil then pcall(function() inst.Transparency = props.Transparency end) end
+        if props.Reflectance ~= nil then pcall(function() inst.Reflectance = props.Reflectance end) end
+        if props.Anchored ~= nil then pcall(function() inst.Anchored = props.Anchored end) end
+        if props.CanCollide ~= nil then pcall(function() inst.CanCollide = props.CanCollide end) end
+        if props.CanQuery ~= nil then pcall(function() inst.CanQuery = props.CanQuery end) end
+        if props.CanTouch ~= nil then pcall(function() inst.CanTouch = props.CanTouch end) end
+        if props.CastShadow ~= nil then pcall(function() inst.CastShadow = props.CastShadow end) end
+        if props.Massless ~= nil then pcall(function() inst.Massless = props.Massless end) end
+        if props.Locked ~= nil then pcall(function() inst.Locked = props.Locked end) end
+        if props.Material then pcall(function() inst.Material = Enum.Material[props.Material] end) end
+        if props.Shape and inst:IsA("Part") then pcall(function() inst.Shape = Enum.PartType[props.Shape] end) end
+    end
+    if inst:IsA("Decal") or inst:IsA("Texture") then
+        if props.Texture then pcall(function() inst.Texture = normalizeMeshId(props.Texture) or props.Texture end) end
+        if props.Color3 and inst:IsA("Decal") then pcall(function() inst.Color3 = Color3.new(unpack(props.Color3)) end) end
+        if props.Transparency ~= nil then pcall(function() inst.Transparency = props.Transparency end) end
+        if props.Face and inst:IsA("FaceInstance") then pcall(function() inst.Face = Enum.NormalId[props.Face] end) end
+    end
+    if inst:IsA("Shirt") or inst:IsA("Pants") or inst:IsA("ShirtGraphic") then
+        if props.Template then pcall(function() inst.Template = props.Template end) end
+    end
+    if inst:IsA("LuaSourceContainer") and props.Source then
+        pcall(function() inst.Source = props.Source end)
+        State.scriptCache[inst] = props.Source
+    end
+    if attrs then
+        for k, v in pairs(attrs) do
+            if k ~= "_CS_Id" and k ~= "_CS_ParentId" and k ~= "_CS_Skip" and k ~= "_CS_ToolboxAssetId" then
+                pcall(function() inst:SetAttribute(k, v) end)
+            end
+        end
+    end
+end
+
+local function serializeInstance(inst)
+    local ok, result = pcall(function()
+        if inst:IsA("Terrain") or inst:IsA("Camera") then return nil end
+        if inst.Name:match("^_CS_") then return nil end
+        if hasSkipAncestor(inst) then return nil end
+        if shouldSkip(inst) then return nil end
+        
+        local id = getOrSetId(inst)
+        local parent = inst.Parent
+        local parentId
+        if parent == game then parentId = "game"
+        elseif parent and parent.Parent == game then parentId = "service:"..parent.Name
+        else parentId = parent and getOrSetId(parent) or "game" end
+        
+        if inst:IsA("Model") then
+            local assetId = inst:GetAttribute("_ToolboxAssetId") or inst:GetAttribute("AssetId")
+            if assetId and tonumber(assetId) then
+                return {id=id, parentId=parentId, className="__ToolboxModel__", name=inst.Name, props={assetId=tostring(assetId)}, attrs={}}
+            end
+        end
+        
+        local props = {}
+        
+        if inst:IsA("BasePart") then
+            props.CFrame = {inst.CFrame:GetComponents()}
+            props.Size = {inst.Size.X, inst.Size.Y, inst.Size.Z}
+            props.Color = {inst.Color.R, inst.Color.G, inst.Color.B}
+            props.Transparency = inst.Transparency
+            props.Reflectance = inst.Reflectance
+            props.Anchored = inst.Anchored
+            props.CanCollide = inst.CanCollide
+            props.CanQuery = inst.CanQuery
+            props.CanTouch = inst.CanTouch
+            props.CastShadow = inst.CastShadow
+            props.Massless = inst.Massless
+            props.Locked = inst.Locked
+            props.Material = inst.Material.Name
+            if inst:IsA("Part") then props.Shape = inst.Shape.Name end
+            if inst:IsA("MeshPart") then
+                local mid = ""; pcall(function() mid = inst.MeshId end)
+                local norm = normalizeMeshId(mid)
+                if norm then props.MeshId = norm end
+                local tid = ""; pcall(function() tid = inst.TextureID end)
+                local ntid = normalizeMeshId(tid)
+                if ntid then props.TextureID = ntid end
+            end
+        elseif inst:IsA("Motor6D") or inst:IsA("Weld") or inst:IsA("Snap") then
+            props.C0 = {inst.C0:GetComponents()}
+            props.C1 = {inst.C1:GetComponents()}
+            if inst:IsA("Motor6D") then props.Transform = {inst.Transform:GetComponents()} end
+            if inst.Part0 then props.Part0Id = inst.Part0:GetAttribute("_CS_Id") end
+            if inst.Part1 then props.Part1Id = inst.Part1:GetAttribute("_CS_Id") end
+        elseif inst:IsA("Humanoid") then
+            props.Health = inst.Health
+            props.MaxHealth = inst.MaxHealth
+            props.WalkSpeed = inst.WalkSpeed
+            props.JumpPower = inst.JumpPower
+            props.HipHeight = inst.HipHeight
+            props.RigType = inst.RigType.Name
+        elseif inst:IsA("DataModelMesh") then
+            if inst:IsA("SpecialMesh") then pcall(function() props.MeshType = inst.MeshType.Name end) end
+            local mid = ""; pcall(function() mid = inst.MeshId end)
+            local norm = normalizeMeshId(mid); if norm then props.MeshId = norm end
+            local tid = ""; pcall(function() tid = inst.TextureId end)
+            local ntid = normalizeMeshId(tid); if ntid then props.TextureId = ntid end
+            props.Scale = {inst.Scale.X, inst.Scale.Y, inst.Scale.Z}
+            props.Offset = {inst.Offset.X, inst.Offset.Y, inst.Offset.Z}
+            if inst:IsA("SpecialMesh") then pcall(function() local vc = inst.VertexColor; if vc then props.VertexColor = {vc.X, vc.Y, vc.Z} end end) end
+        elseif inst:IsA("LuaSourceContainer") then
+            props.Source = inst.Source
+        elseif inst:IsA("Decal") or inst:IsA("Texture") then
+            local tex = ""; pcall(function() tex = inst.Texture end)
+            local ntex = normalizeMeshId(tex); if ntex then props.Texture = ntex end
+            if inst:IsA("Decal") then props.Color3 = {inst.Color3.R, inst.Color3.G, inst.Color3.B}; props.Transparency = inst.Transparency end
+            pcall(function() props.Face = inst.Face.Name end)
+        elseif inst:IsA("Shirt") or inst:IsA("Pants") or inst:IsA("ShirtGraphic") then
+            local tmpl = ""; pcall(function() tmpl = inst.Template or inst.Graphic end)
+            if tmpl and tmpl ~= "" then props.Template = tmpl end
+        end
+        
+        local attrs = {}
+        for k, v in pairs(inst:GetAttributes()) do
+            if k ~= "_CS_Id" and k ~= "_CS_ParentId" and k ~= "_CS_Skip" and k ~= "_CS_ToolboxAssetId" then attrs[k] = v end
+        end
+        return {id=id, parentId=parentId, className=inst.ClassName, name=inst.Name, props=props, attrs=attrs}
+    end)
+    if ok then return result end
+    return nil
+end
+
+local function buildTree(inst, out, limit)
+    if limit and #out >= limit then return end
+    local s = serializeInstance(inst)
+    if s then table.insert(out, s) end
+    if limit and #out >= limit then return end
+    for _, child in ipairs(inst:GetChildren()) do 
+        if limit and #out >= limit then return end
+        buildTree(child, out, limit) 
+    end
+end
+local function buildSnapshot()
+    local out = {}
+    for _, svc in ipairs(SYNC_SERVICES) do
+        for _, inst in ipairs(svc:GetChildren()) do 
+            if #out >= 60000 then break end
+            buildTree(inst, out, 60000) 
+        end
+        if #out >= 60000 then break end
+    end
+    return out
+end
+local function sendDelta(kind, data)
+    if not State.wsClient or not State.connected then return end
+    local payload = {type="delta", id=HttpService:GenerateGUID(false), kind=kind, userId=MY_ID, userName=MY_NAME, ts=os.time()}
+    for k, v in pairs(data) do payload[k] = v end
+    pcall(function() State.wsClient:Send(HttpService:JSONEncode(payload)) end)
+end
+
+watchInstance = function(inst)
+    if State.watched[inst] then return end
+    if inst.Name:match("^_CS_") then return end
+    if hasSkipAncestor(inst) then return end
+    if shouldSkip(inst) then return end
+    State.watched[inst] = true
+    getOrSetId(inst)
+    local function scheduleUpdate(prop)
+        if State.applyingRemote[inst] then return end
+        if prop == "_CS_Id" or prop == "_CS_ParentId" then return end
+        if State.partThrottle[inst] then return end
+        State.partThrottle[inst] = true
+        task.delay(0.15, function()
+            State.partThrottle[inst] = nil
+            if State.applyingRemote[inst] then return end
+            if not inst.Parent then return end
+            local s = serializeInstance(inst)
+            if s then sendDelta("update", s) end
+        end)
+    end
+    inst.Changed:Connect(function(prop) scheduleUpdate(prop) end)
+    if inst:IsA("BasePart") then
+        pcall(function()
+            inst:GetPropertyChangedSignal("CFrame"):Connect(function() scheduleUpdate("CFrame") end)
+            inst:GetPropertyChangedSignal("Position"):Connect(function() scheduleUpdate("Position") end)
+            inst:GetPropertyChangedSignal("Name"):Connect(function() scheduleUpdate("Name") end)
+            inst:GetPropertyChangedSignal("Reflectance"):Connect(function() scheduleUpdate("Reflectance") end)
+            inst:GetPropertyChangedSignal("CastShadow"):Connect(function() scheduleUpdate("CastShadow") end)
+            inst:GetPropertyChangedSignal("Locked"):Connect(function() scheduleUpdate("Locked") end)
+        end)
+    end
+    if inst:IsA("DataModelMesh") then
+        pcall(function()
+            inst:GetPropertyChangedSignal("Scale"):Connect(function() scheduleUpdate("Scale") end)
+            inst:GetPropertyChangedSignal("MeshId"):Connect(function() scheduleUpdate("MeshId") end)
+            inst:GetPropertyChangedSignal("TextureId"):Connect(function() scheduleUpdate("TextureId") end)
+        end)
+    end
+    if inst:IsA("Motor6D") then
+        pcall(function()
+            inst:GetPropertyChangedSignal("C0"):Connect(function() scheduleUpdate("C0") end)
+            inst:GetPropertyChangedSignal("C1"):Connect(function() scheduleUpdate("C1") end)
+        end)
+    end
+    inst.AttributeChanged:Connect(function(attr)
+        if attr == "_CS_Id" or attr == "_CS_ParentId" or attr == "_CS_Skip" or attr == "_CS_OrigName" or attr == "_CS_OrigText" then return end
+        if State.applyingRemote[inst] then return end
+        local s = serializeInstance(inst)
+        if s then sendDelta("update", s) end
+    end)
+end
+
+--=== helper: mesh retry (independent checks) ===
+local function spawnMeshRetry(inst, props, attempts)
+    if not props then return end
+    local targetMesh = props.MeshId
+    local targetTex = props.TextureID or props.TextureId
+    local targetSize = props.Size
+    local targetScale = props.Scale
+    if not (targetMesh or targetTex or targetSize or targetScale) then return end
+    task.spawn(function()
+        for _ = 1, (attempts or 40) do
+            task.wait(0.15)
+            if not inst or not inst.Parent then return end
+            local done = true
+            if targetMesh then
+                local cur = ""
+                pcall(function()
+                    if inst:IsA("MeshPart") then cur = inst.MeshId
+                    elseif inst:IsA("DataModelMesh") then cur = inst.MeshId end
+                end)
+                local norm = normalizeMeshId(targetMesh) or targetMesh
+                if cur ~= norm then
+                    pcall(function()
+                        if inst:IsA("MeshPart") then inst.MeshId = norm
+                        elseif inst:IsA("DataModelMesh") then inst.MeshId = norm end
+                    end)
+                    done = false
+                end
+            end
+            if targetTex then
+                local cur = ""
+                pcall(function()
+                    if inst:IsA("MeshPart") then cur = inst.TextureID
+                    elseif inst:IsA("DataModelMesh") then cur = inst.TextureId end
+                end)
+                local norm = normalizeMeshId(targetTex) or targetTex
+                if cur ~= norm then
+                    pcall(function()
+                        if inst:IsA("MeshPart") then inst.TextureID = norm
+                        elseif inst:IsA("DataModelMesh") then inst.TextureId = norm end
+                    end)
+                    done = false
+                end
+            end
+            if targetSize and inst:IsA("BasePart") then
+                local tS = Vector3.new(unpack(targetSize))
+                if (inst.Size - tS).Magnitude > 0.01 then
+                    pcall(function() inst.Size = tS end)
+                    done = false
+                end
+            end
+            if targetScale and inst:IsA("DataModelMesh") then
+                local tS = Vector3.new(unpack(targetScale))
+                if (inst.Scale - tS).Magnitude > 0.01 then
+                    pcall(function() inst.Scale = tS end)
+                    done = false
+                end
+            end
+            if done then break end
+        end
+    end)
+end
+
+applyDelta = function(delta)
+    if not delta or not delta.id then return end
+    if State.applyingRemote[delta.id] then return end
+    State.applyingRemote[delta.id] = true
+    local ok, err = pcall(function()
+        if delta.kind == "camera" then
+            if delta.userId ~= MY_ID and delta.cframe then
+                if not State.synced then return end
+                if not State.localMarkers[delta.userId] then createLocalMarker(delta.userId, resolveName(delta.userId)) end
+                updateLocalMarker(delta.userId, CFrame.new(unpack(delta.cframe)))
+            end
+            return
+        end
+        sanitizeProps(delta.props)
+        
+        if delta.kind == "create" then
+            local existing = State.objectMap[delta.id]
+            if existing and existing.Parent then return end
+            if existing and not existing.Parent then
+                local parent
+                if delta.parentId == "game" then parent = game
+                elseif delta.parentId:match("^service:") then parent = game:GetService(delta.parentId:sub(9))
+                else parent = State.objectMap[delta.parentId] end
+                if parent then pcall(function() existing.Parent = parent end) end
+                return
+            end
+            if SKIP_CLASSES[delta.className] then return end
+            
+            if delta.className == "__ToolboxModel__" and delta.props and delta.props.assetId then
+                local assetId = tonumber(delta.props.assetId)
+                if assetId then
+                    local loaded = false
+                    pcall(function()
+                        local model = InsertService:LoadAsset(assetId)
+                        if model then
+                            local firstChild = model:GetChildren()[1]
+                            if firstChild then
+                                local parent
+                                if delta.parentId == "game" then parent = game
+                                elseif delta.parentId:match("^service:") then parent = game:GetService(delta.parentId:sub(9))
+                                else parent = State.objectMap[delta.parentId] end
+                                if parent then
+                                    firstChild.Name = delta.name
+                                    firstChild:SetAttribute("_CS_Id", delta.id)
+                                    firstChild:SetAttribute("_CS_ToolboxAssetId", tostring(assetId))
+                                    firstChild.Parent = parent
+                                    State.objectMap[delta.id] = firstChild
+                                    loaded = true
+                                    logMsg("lobby", "info", "Toolbox загружен: "..delta.name.." (assetId="..assetId..")")
+                                end
+                            end
+                            model:Destroy()
+                        end
+                    end)
+                    if not loaded then logMsg("plugin", "warn", "Toolbox load failed for "..delta.name) end
+                end
+                return
+            end
+            
+            local success, newInst = pcall(function() return Instance.new(delta.className) end)
+            if success and newInst then
+                newInst.Name = delta.name
+                newInst:SetAttribute("_CS_Id", delta.id)
+                newInst:SetAttribute("_CS_ParentId", delta.parentId)
+                applyProps(newInst, delta.props, delta.attrs)
+                local parent
+                if delta.parentId == "game" then parent = game
+                elseif delta.parentId:match("^service:") then parent = game:GetService(delta.parentId:sub(9))
+                else parent = State.objectMap[delta.parentId] end
+                if parent then
+                    State.applyingRemote[newInst] = true
+                    local ok2 = pcall(function() newInst.Parent = parent end)
+                    if not ok2 then newInst:Destroy(); return end
+                    task.delay(0.15, function() State.applyingRemote[newInst] = nil end)
+                end
+                State.objectMap[delta.id] = newInst
+                watchInstance(newInst)
+                if (delta.className == "MeshPart" or delta.className == "SpecialMesh") and delta.props then
+                    spawnMeshRetry(newInst, delta.props, 40)
+                end
+                if (delta.className == "Motor6D" or delta.className == "Weld" or delta.className == "Snap") and delta.props then
+                    task.spawn(function()
+                        for _ = 1, 15 do
+                            task.wait(0.1)
+                            if not newInst or not newInst.Parent then return end
+                            if delta.props.Part0Id and not newInst.Part0 then local p0 = State.objectMap[delta.props.Part0Id]; if p0 then pcall(function() newInst.Part0 = p0 end) end end
+                            if delta.props.Part1Id and not newInst.Part1 then local p1 = State.objectMap[delta.props.Part1Id]; if p1 then pcall(function() newInst.Part1 = p1 end) end end
+                        end
+                    end)
+                end
+                if delta.userId ~= MY_ID and (delta.parentId == "game" or delta.parentId:match("^service:")) then
+                    local msg = formatName(delta.userId).." создал "..(delta.name or "объект")
+                    logMsg("lobby", "action", msg)
+                    if Main then showToast(Main, msg, T.success) end
+                end
+            end
+        elseif delta.kind == "update" then
+            local inst = State.objectMap[delta.id]
+            if inst then
+                State.applyingRemote[inst] = true
+                applyProps(inst, delta.props, delta.attrs)
+                if delta.name and inst.Name ~= delta.name then pcall(function() inst.Name = delta.name end) end
+                if (inst:IsA("MeshPart") or inst:IsA("DataModelMesh")) and delta.props then
+                    spawnMeshRetry(inst, delta.props, 20)
+                end
+                task.delay(0.1, function() State.applyingRemote[inst] = nil end)
+            end
+        elseif delta.kind == "delete" then
+            local inst = State.objectMap[delta.id]
+            if inst then
+                if delta.userId ~= MY_ID and inst.Parent and inst.Parent.Parent == game then
+                    local msg = formatName(delta.userId).." удалил "..(inst.Name or "объект")
+                    logMsg("lobby", "action", msg)
+                    if Main then showToast(Main, msg, T.warn) end
+                end
+                if inst.Parent then pcall(function() inst:Destroy() end) end
+            end
+            State.objectMap[delta.id] = nil
+        elseif delta.kind == "select" then
+            local inst = State.objectMap[delta.id]
+            if inst and inst.Parent then
+                local selName = "_CS_Sel_"..delta.userId
+                local existing = inst:FindFirstChild(selName)
+                if delta.active then
+                    if not existing then
+                        local hl = Instance.new("Highlight")
+                        hl.Name = selName; hl.FillColor = sphereColor(delta.userId); hl.OutlineColor = sphereColor(delta.userId)
+                        hl.FillTransparency = 0.7; hl.OutlineTransparency = 0; hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                        hl.Adornee = inst; hl:SetAttribute("_CS_Skip", true); hl.Parent = inst
+                    end
+                else if existing then existing:Destroy() end end
+            end
+        end
+    end)
+    if not ok then logMsg("plugin", "error", "applyDelta: "..tostring(err)) end
+    State.applyingRemote[delta.id] = nil
+end
+
+local function startWatching()
+    for _, svc in ipairs(SYNC_SERVICES) do
+        for _, inst in ipairs(svc:GetDescendants()) do watchInstance(inst) end
+        svc.DescendantAdded:Connect(function(inst)
+            if inst.Name:match("^_CS_") then return end
+            if hasSkipAncestor(inst) then return end
+            if shouldSkip(inst) then return end
+            if State.applyingSnapshot then return end
+            if State.applyingRemote[inst] then return end
+            if not State.connected then return end
+            if not State.watched[inst] then
+                local s = serializeInstance(inst)
+                if s then sendDelta("create", s) end
+                watchInstance(inst)
+            end
+        end)
+        svc.DescendantRemoving:Connect(function(inst)
+            if inst.Name:match("^_CS_") then return end
+            if hasSkipAncestor(inst) then return end
+            if State.applyingSnapshot then return end
+            if State.applyingRemote[inst] then return end
+            local id = inst:GetAttribute("_CS_Id")
+            if id then sendDelta("delete", {id=id}); State.objectMap[id] = nil end
+        end)
+    end
+end
+
+onSelectionChanged = function()
+    if not State.connected then return end
+    for _, inst in pairs(State.selectionMap[MY_ID] or {}) do
+        if inst and inst.Parent then
+            local id = inst:GetAttribute("_CS_Id")
+            if id then sendDelta("select", {id=id, active=false, userId=MY_ID}) end
+        end
+    end
+    State.selectionMap[MY_ID] = {}
+    if not Selection then return end
+    for _, inst in ipairs(Selection:Get()) do
+        if not inst.Name:match("^_CS_") and not hasSkipAncestor(inst) then
+            local id = inst:GetAttribute("_CS_Id")
+            if id then sendDelta("select", {id=id, active=true, userId=MY_ID}); table.insert(State.selectionMap[MY_ID], inst) end
+        end
+    end
+end
+
+--==================================================================
+-- Root & Loading
+--==================================================================
+root = I("ScreenGui", {Name="CollabSync", ResetOnSpawn=false, IgnoreGuiInset=true, ZIndexBehavior=Enum.ZIndexBehavior.Sibling, DisplayOrder=100}, CoreGui)
+if PLUGIN then
+    pcall(function()
+        local tb = PLUGIN:CreateToolbar("CollabSync")
+        local b = tb:CreateButton("CollabSync", "Открыть/закрыть", "")
+        b.Click:Connect(function() root.Enabled = not root.Enabled end)
+    end)
+end
+
+local loadingOverlay = nil
+local function showLoadingSteps(title, steps, onComplete, onError)
+    if loadingOverlay then loadingOverlay:Destroy() end
+    loadingOverlay = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=0.55, BorderSizePixel=0, ZIndex=200}, root)
+    local box = I("Frame", {Size=UDim2.fromOffset(420,240), Position=UDim2.fromScale(0.5,0.5), AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=T.surface, BorderSizePixel=0, ZIndex=201}, loadingOverlay)
+    round(box, 12); outline(box, T.border, 1)
+    lbl(box, title, {font=Enum.Font.GothamBold, textSize=17, size=UDim2.new(1,-40,0,26), pos=UDim2.fromOffset(20,18), zIndex=202})
+    local stepLbl = lbl(box, "Подготовка...", {textSize=12, color=T.muted, size=UDim2.new(1,-40,0,20), pos=UDim2.fromOffset(20,50), zIndex=202})
+    local pb = I("Frame", {Size=UDim2.new(1,-40,0,10), Position=UDim2.fromOffset(20,88), BackgroundColor3=T.surf3, BorderSizePixel=0, ZIndex=202}, box); round(pb, 5)
+    local pf = I("Frame", {Size=UDim2.fromScale(0,1), BackgroundColor3=T.accent, BorderSizePixel=0, ZIndex=203}, pb); round(pf, 5)
+    local pct = lbl(box, "0%", {textSize=12, color=T.accent, font=Enum.Font.GothamBold, size=UDim2.new(1,-40,0,18), pos=UDim2.fromOffset(20,108), zIndex=202, xAlign=Enum.TextXAlignment.Right})
+    local logLbl = lbl(box, "", {textSize=11, color=T.muted, wrapped=true, size=UDim2.new(1,-40,0,40), pos=UDim2.fromOffset(20,136), zIndex=202, autoSize=Enum.AutomaticSize.Y})
+    local cancelled = false
+    local function finish(ok, err)
+        if ok then if loadingOverlay then loadingOverlay:Destroy() end; loadingOverlay = nil; if onComplete then pcall(onComplete) end
+        else stepLbl.Text = "ОШИБКА"; pf.BackgroundColor3 = T.danger; logLbl.Text = "✗ "..tostring(err); logLbl.TextColor3 = T.danger; logMsg("plugin", "error", tostring(err)); task.wait(1.5); if loadingOverlay then loadingOverlay:Destroy() end; loadingOverlay = nil; if onError then pcall(onError, err) end end
+    end
+    task.spawn(function()
+        for i, step in ipairs(steps) do
+            if cancelled then return end
+            local p = math.floor(((i-1)/#steps)*100)
+            pf.Size = UDim2.fromScale(p/100, 1); pct.Text = p.."%"; stepLbl.Text = step.label; logLbl.Text = "→ "..step.label
+            local ok, sOk, sErr = pcall(step.fn)
+            if not ok then finish(false, "Крит: "..tostring(sOk)); return
+            elseif sOk == false then finish(false, sErr or "?"); return end
+            task.wait(0.05)
+        end
+        pf.Size = UDim2.fromScale(1, 1); pct.Text = "100%"; stepLbl.Text = "Готово"; logLbl.Text = "✓ Активно"; logLbl.TextColor3 = T.success
+        task.wait(0.35); finish(true)
+    end)
+end
+
+local function promptPassword(onSuccess)
+    local ov = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=0.55, BorderSizePixel=0, ZIndex=250}, root)
+    local dlg = I("Frame", {Size=UDim2.fromOffset(360,190), Position=UDim2.fromScale(0.5,0.5), AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=T.surface, BorderSizePixel=0, ZIndex=251}, ov)
+    round(dlg, 12); outline(dlg, T.border, 1)
+    lbl(dlg, "Пароль", {font=Enum.Font.GothamBold, textSize=17, size=UDim2.new(1,-40,0,26), pos=UDim2.fromOffset(20,18), zIndex=252})
+    local box = I("Frame", {Size=UDim2.new(1,-40,0,40), Position=UDim2.fromOffset(20,74), BackgroundColor3=T.surf2, BorderSizePixel=0, ZIndex=252}, dlg); round(box, 8); outline(box, T.border, 1)
+    local tb = I("TextBox", {Size=UDim2.new(1,-20,1,0), Position=UDim2.fromOffset(10,0), BackgroundTransparency=1, BorderSizePixel=0, Font=Enum.Font.Gotham, TextSize=14, TextColor3=T.text, PlaceholderText="Пароль", PlaceholderColor3=T.muted, Text="", ClearTextOnFocus=false, ZIndex=253}, box)
+    local cancel = btn(dlg, "Отмена", {size=UDim2.fromOffset(130,38), pos=UDim2.fromOffset(20,130), bg=T.surf2, hoverBg=T.border, textSize=13, zIndex=252})
+    local ok = btn(dlg, "Войти", {size=UDim2.new(1,-170,0,38), pos=UDim2.fromOffset(160,130), bg=T.accent, hoverBg=T.accent2, textSize=13, zIndex=252})
+    local function close() ov:Destroy() end
+    cancel.MouseButton1Click:Connect(close)
+    ok.MouseButton1Click:Connect(function() local p = tb.Text; close(); if p ~= "" then onSuccess(p) end end)
+    tb.FocusLost:Connect(function(e) if e then local p = tb.Text; close(); if p ~= "" then onSuccess(p) end end end)
+    tb:CaptureFocus()
+end
+
+--==================================================================
+-- MAIN UI
+--==================================================================
+Main = I("Frame", {Name="MainFrame", Size=UDim2.fromOffset(860,600), Position=UDim2.new(0.5,-430,0.5,-300), BackgroundColor3=T.bg, BorderSizePixel=0}, root)
+round(Main, 14); outline(Main, T.border, 1)
+local lastVisibleFrame = Main
+local previousScreen = nil
+local Header = I("Frame", {Size=UDim2.new(1,0,0,62), BackgroundColor3=T.surface, BorderSizePixel=0}, Main)
+round(Header, 14)
+lbl(Header, "CollabSync", {font=Enum.Font.GothamBold, textSize=20, size=UDim2.fromOffset(300,26), pos=UDim2.fromOffset(20,14), zIndex=2})
+lbl(Header, "v5.4", {textSize=12, color=T.muted, size=UDim2.fromOffset(300,16), pos=UDim2.fromOffset(20,38), zIndex=2})
+local meHead = avatar(Header, 28, MY_ID); meHead.Position = UDim2.new(1, -430, 0, 17); meHead.ZIndex = 4
+meNameLbl = lbl(Header, formatName(MY_ID), {textSize=12, color=nameColor(MY_ID), size=UDim2.fromOffset(160,28), pos=UDim2.new(1, -396, 0, 17), zIndex=4, truncate=true})
+applyNameStyle(meNameLbl, MY_ID)
+local dragMain = I("TextButton", {Size=UDim2.new(1,-490,1,0), BackgroundTransparency=1, BorderSizePixel=0, Text="", AutoButtonColor=false, ZIndex=3}, Header)
+makeDraggable(Main, dragMain)
+local logsBtn = btn(Header, "📋", {size=UDim2.fromOffset(36,36), pos=UDim2.new(1,-196,0,13), bg=T.surf2, hoverBg=T.border, textSize=18, zIndex=4})
+local settingsBtn = btn(Header, "⚙", {size=UDim2.fromOffset(36,36), pos=UDim2.new(1,-144,0,13), bg=T.surf2, hoverBg=T.border, textSize=18, zIndex=4})
+local minimizeMain = btn(Header, "–", {size=UDim2.fromOffset(36,36), pos=UDim2.new(1,-100,0,13), bg=T.surf2, hoverBg=T.border, textSize=18, zIndex=4})
+local closeBtn = btn(Header, "×", {size=UDim2.fromOffset(36,36), pos=UDim2.new(1,-56,0,13), bg=T.surf2, hoverBg=T.danger, textSize=20, zIndex=4})
+closeBtn.MouseButton1Click:Connect(function() root.Enabled = false end)
+minimizeMain.MouseButton1Click:Connect(function()
+    Main.Visible = false; S.Visible = false; InPlace.Visible = false
+    minimizedBtn.Visible = true
+end)
+
+local TabBar = I("Frame", {Size=UDim2.new(1,-40,0,44), Position=UDim2.fromOffset(20,78), BackgroundColor3=T.surface, BorderSizePixel=0}, Main)
+round(TabBar, 10)
+local tabLobby = btn(TabBar, "Лобби", {size=UDim2.fromOffset(140,34), pos=UDim2.fromOffset(5,5), bg=T.accent, hoverBg=T.accent2, textSize=13})
+local tabCreate = btn(TabBar, "+ Создать", {size=UDim2.fromOffset(140,34), pos=UDim2.fromOffset(150,5), bg=T.surface, hoverBg=T.surf2, textSize=13})
+local tabDirect = btn(TabBar, "Прямое", {size=UDim2.fromOffset(120,34), pos=UDim2.fromOffset(295,5), bg=T.surface, hoverBg=T.surf2, textSize=13})
+
+local Content = I("Frame", {Size=UDim2.new(1,-40,1,-140), Position=UDim2.fromOffset(20,130), BackgroundTransparency=1, BorderSizePixel=0}, Main)
+
+-- Browser
+local Browser = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1}, Content)
+local scroll = I("ScrollingFrame", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, BorderSizePixel=0, CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y, ScrollBarThickness=6, ScrollBarImageColor3=T.border}, Browser)
+I("UIListLayout", {Padding=UDim.new(0,16), SortOrder=Enum.SortOrder.LayoutOrder}, scroll)
+
+local accessSection = I("Frame", {Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1, LayoutOrder=1}, scroll)
+I("UIListLayout", {Padding=UDim.new(0,10), SortOrder=Enum.SortOrder.LayoutOrder}, accessSection)
+lbl(accessSection, "Доступные вам места", {font=Enum.Font.GothamBold, textSize=14, color=T.muted, size=UDim2.new(1,0,0,20)})
+local aList = I("Frame", {Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1, Position=UDim2.fromOffset(0,26)}, accessSection)
+I("UIListLayout", {Padding=UDim.new(0,10), SortOrder=Enum.SortOrder.LayoutOrder}, aList)
+
+local allSection = I("Frame", {Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1, LayoutOrder=2}, scroll)
+I("UIListLayout", {Padding=UDim.new(0,10), SortOrder=Enum.SortOrder.LayoutOrder}, allSection)
+lbl(allSection, "Все лобби", {font=Enum.Font.GothamBold, textSize=14, color=T.muted, size=UDim2.new(1,0,0,20)})
+local aListAll = I("Frame", {Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1, Position=UDim2.fromOffset(0,26)}, allSection)
+I("UIListLayout", {Padding=UDim.new(0,10), SortOrder=Enum.SortOrder.LayoutOrder}, aListAll)
+
+-- Create tab
+local Create = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Visible=false}, Content)
+local function fieldRow(label, placeholder, yPos)
+    local row = I("Frame", {Size=UDim2.new(1,0,0,60), Position=UDim2.fromOffset(0,yPos), BackgroundTransparency=1}, Create)
+    lbl(row, label, {textSize=12, color=T.muted, size=UDim2.new(1,0,0,18)})
+    local box = I("Frame", {Size=UDim2.new(1,0,0,40), Position=UDim2.fromOffset(0,20), BackgroundColor3=T.surface, BorderSizePixel=0}, row)
+    round(box, 8); outline(box, T.border, 1)
+    return I("TextBox", {Size=UDim2.new(1,-20,1,0), Position=UDim2.fromOffset(10,0), BackgroundTransparency=1, BorderSizePixel=0, Font=Enum.Font.Gotham, TextSize=14, TextColor3=T.text, PlaceholderText=placeholder, PlaceholderColor3=T.muted, Text="", TextXAlignment=Enum.TextXAlignment.Left}, box)
+end
+
+lbl(Create, "Создание лобби", {font=Enum.Font.GothamBold, textSize=18, size=UDim2.new(1,0,0,28)})
+local createNameBox = fieldRow("Название", "Team Alpha", 36)
+local createPassBox = fieldRow("Пароль (пусто = открытое)", "••••••", 110)
+local createServ2Box = fieldRow("Server 2 URL", DEFAULT_HOST_URL, 184)
+
+local confRow = I("Frame", {Size=UDim2.new(1,0,0,40), Position=UDim2.fromOffset(0,258), BackgroundColor3=T.surface, BorderSizePixel=0}, Create)
+round(confRow, 8); outline(confRow, T.border, 1)
+lbl(confRow, "Скрывать инфо о месте", {textSize=13, size=UDim2.new(1,-120,1,0), pos=UDim2.fromOffset(14,0)})
+local confToggle = I("Frame", {Size=UDim2.fromOffset(44,24), Position=UDim2.new(1,-60,0.5,-12), BackgroundColor3=T.surf3, BorderSizePixel=0}, confRow)
+round(confToggle, 12)
+local confDot = I("Frame", {Size=UDim2.fromOffset(18,18), Position=UDim2.fromOffset(3,3), BackgroundColor3=T.text, BorderSizePixel=0}, confToggle)
+round(confDot, 9)
+local confOn = false
+I("TextButton", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text=""}, confToggle).MouseButton1Click:Connect(function()
+    confOn = not confOn; confToggle.BackgroundColor3 = confOn and T.accent or T.surf3
+    confDot.Position = confOn and UDim2.fromOffset(23,3) or UDim2.fromOffset(3,3)
+end)
+
+local publishBtn = btn(Create, "Опубликовать", {size=UDim2.new(1,0,0,44), pos=UDim2.fromOffset(0,340), bg=T.accent, hoverBg=T.accent2, textSize=14})
+
+-- Direct tab
+local Direct = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Visible=false}, Content)
+lbl(Direct, "Прямое подключение", {font=Enum.Font.GothamBold, textSize=18, size=UDim2.new(1,0,0,28)})
+local directUrlBox = I("TextBox", {Size=UDim2.new(1,0,0,40), Position=UDim2.fromOffset(0,66), BackgroundColor3=T.surface, BorderSizePixel=0, Font=Enum.Font.Gotham, TextSize=13, TextColor3=T.text, PlaceholderText="wss://...", PlaceholderColor3=T.muted, Text="", TextXAlignment=Enum.TextXAlignment.Left}, Direct)
+round(directUrlBox, 8); outline(directUrlBox, T.border, 1); pad(directUrlBox, 8, 10)
+local directTokenBox = I("TextBox", {Size=UDim2.new(1,0,0,40), Position=UDim2.fromOffset(0,116), BackgroundColor3=T.surface, BorderSizePixel=0, Font=Enum.Font.Gotham, TextSize=13, TextColor3=T.text, PlaceholderText="JWT", PlaceholderColor3=T.muted, Text="", TextXAlignment=Enum.TextXAlignment.Left}, Direct)
+round(directTokenBox, 8); outline(directTokenBox, T.border, 1); pad(directTokenBox, 8, 10)
+local directBtn = btn(Direct, "Подключиться", {size=UDim2.new(1,0,0,44), pos=UDim2.fromOffset(0,170), bg=T.accent, hoverBg=T.accent2, textSize=14})
+
+local switchTo
+switchTo = function(which)
+    Browser.Visible = (which == "lobby"); Create.Visible = (which == "create"); Direct.Visible = (which == "direct")
+    tabLobby.BackgroundColor3 = (which == "lobby") and T.accent or T.surface
+    tabCreate.BackgroundColor3 = (which == "create") and T.accent or T.surface
+    tabDirect.BackgroundColor3 = (which == "direct") and T.accent or T.surface
+end
+tabLobby.MouseButton1Click:Connect(function() switchTo("lobby") end)
+tabCreate.MouseButton1Click:Connect(function() switchTo("create") end)
+tabDirect.MouseButton1Click:Connect(function() switchTo("direct") end)
+
+--==================================================================
+-- LogsWindow
+--==================================================================
+LogsWindow = I("Frame", {Name="LogsFrame", Size=UDim2.fromOffset(700,500), Position=UDim2.new(0.5,-350,0.5,-250), BackgroundColor3=T.bg, BorderSizePixel=0, Visible=false, ZIndex=150}, root)
+round(LogsWindow, 14); outline(LogsWindow, T.border, 1)
+local LHeader = I("Frame", {Size=UDim2.new(1,0,0,50), BackgroundColor3=T.surface, BorderSizePixel=0}, LogsWindow)
+round(LHeader, 14)
+lbl(LHeader, "Логи", {font=Enum.Font.GothamBold, textSize=16, size=UDim2.fromOffset(300,26), pos=UDim2.fromOffset(20,12), zIndex=2})
+local lDrag = I("TextButton", {Size=UDim2.new(1,-300,1,0), BackgroundTransparency=1, BorderSizePixel=0, Text="", AutoButtonColor=false, ZIndex=3}, LHeader)
+makeDraggable(LogsWindow, lDrag)
+local lClearBtn = btn(LHeader, "Очистить", {size=UDim2.fromOffset(90,30), pos=UDim2.new(1,-250,0,10), bg=T.surf2, hoverBg=T.warn, textSize=11, zIndex=4})
+local lCopyBtn = btn(LHeader, "Копир.", {size=UDim2.fromOffset(80,30), pos=UDim2.new(1,-155,0,10), bg=T.accent, hoverBg=T.accent2, textSize=11, zIndex=4})
+local lCloseBtn = btn(LHeader, "×", {size=UDim2.fromOffset(36,36), pos=UDim2.new(1,-56,0,7), bg=T.surf2, hoverBg=T.danger, textSize=20, zIndex=4})
+lCloseBtn.MouseButton1Click:Connect(function() LogsWindow.Visible = false end)
+
+local LFilter = lbl(LogsWindow, "", {textSize=11, color=T.muted, size=UDim2.new(1,-40,0,16), pos=UDim2.fromOffset(20,58)})
+local LScroll = I("ScrollingFrame", {Size=UDim2.new(1,-40,1,-100), Position=UDim2.fromOffset(20,80), BackgroundColor3=T.surface, BorderSizePixel=0, CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y, ScrollBarThickness=6, ScrollBarImageColor3=T.border}, LogsWindow)
+round(LScroll, 8); outline(LScroll, T.border, 1); pad(LScroll, 8)
+local LList = I("Frame", {Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1}, LScroll)
+I("UIListLayout", {Padding=UDim.new(0,2)}, LList)
+
+local function refreshLogsUI()
+    if not LogsWindow or not LogsWindow.Visible then return end
+    for _, ch in ipairs(LList:GetChildren()) do if ch:IsA("TextLabel") then ch:Destroy() end end
+    local inLobby = State.session ~= nil
+    LFilter.Text = inLobby and "Режим: Лобби" or "Режим: Плагин"
+    local count = 0
+    for _, entry in ipairs(State.logs) do
+        if inLobby or entry.scope == "plugin" then
+            count = count + 1
+            local color = T.text
+            local prefix = ""
+            if entry.level == "error" then color = T.danger; prefix = "[ERR] "
+            elseif entry.level == "warn" then color = T.warn; prefix = "[WRN] "
+            elseif entry.level == "action" then color = T.accent; prefix = "[ACT] "
+            elseif entry.level == "success" then color = T.success; prefix = "[OK] " end
+            I("TextLabel", {Size=UDim2.new(1,0,0,18), BackgroundTransparency=1, Font=Enum.Font.Code, TextSize=11, TextColor3=color, TextXAlignment=Enum.TextXAlignment.Left, Text=entry.time.."  "..prefix..entry.text}, LList)
+        end
+    end
+    if count == 0 then lbl(LList, "Пусто.", {textSize=12, color=T.muted, size=UDim2.new(1,0,0,20)}) end
+    task.defer(function() task.wait(0.05); if LScroll then LScroll.CanvasPosition = Vector2.new(0, math.max(0, LScroll.AbsoluteCanvasSize.Y - LScroll.AbsoluteWindowSize.Y)) end end)
+end
+_G.__collabsync_update_logs = refreshLogsUI
+
+local function toggleLogs()
+    if not LogsWindow then return end
+    LogsWindow.Visible = not LogsWindow.Visible
+    if LogsWindow.Visible then refreshLogsUI() end
+end
+logsBtn.MouseButton1Click:Connect(toggleLogs)
+lClearBtn.MouseButton1Click:Connect(function() State.logs = {}; refreshLogsUI() end)
+lCopyBtn.MouseButton1Click:Connect(function()
+    local inLobby = State.session ~= nil
+    local text = "=== CollabSync ===\n"
+    for _, entry in ipairs(State.logs) do
+        if inLobby or entry.scope == "plugin" then text = text..entry.time.." ["..entry.level.."] "..entry.text.."\n" end
+    end
+    local ok = pcall(function() setclipboard(text) end)
+    showToast(LogsWindow, ok and "Скопировано" or "Ошибка", ok and T.success or T.danger)
+end)
+
+--==================================================================
+-- Refresh styles hook (called when server1 roles arrive)
+--==================================================================
+_G.__collabsync_refresh_styles = function()
+    if meNameLbl and meNameLbl.Parent then
+        pcall(function()
+            meNameLbl.Text = formatName(MY_ID)
+            meNameLbl.TextColor3 = nameColor(MY_ID)
+        end)
+    end
+    for uid in pairs(State.localMarkers) do
+        if refreshMarkerStyle then pcall(refreshMarkerStyle, uid) end
+    end
+    if refreshPlayerList then pcall(refreshPlayerList) end
+end
+
+--==================================================================
+-- SETTINGS
+--==================================================================
+S = I("Frame", {Name="SettingsFrame", Size=UDim2.fromOffset(860,600), Position=UDim2.new(0.5,-430,0.5,-300), BackgroundColor3=T.bg, BorderSizePixel=0, Visible=false}, root)
+round(S, 14); outline(S, T.border, 1)
+local closeSettings
+closeSettings = function()
+    S.Visible = false; local target = previousScreen or Main
+    if not target or not target.Parent then target = Main end
+    target.Visible = true; lastVisibleFrame = target; previousScreen = nil
+end
+
+local SHeader = I("Frame", {Size=UDim2.new(1,0,0,62), BackgroundColor3=T.surface, BorderSizePixel=0}, S)
+round(SHeader, 14)
+lbl(SHeader, "Настройки", {font=Enum.Font.GothamBold, textSize=16, size=UDim2.fromOffset(300,26), pos=UDim2.fromOffset(20,18), zIndex=2})
+local sBack = btn(SHeader, "← Назад", {size=UDim2.fromOffset(100,34), pos=UDim2.new(1,-250,0,14), bg=T.surf2, hoverBg=T.border, textSize=13, zIndex=4})
+sBack.MouseButton1Click:Connect(function() closeSettings() end)
+local sDrag = I("TextButton", {Size=UDim2.new(1,-350,1,0), BackgroundTransparency=1, BorderSizePixel=0, Text="", AutoButtonColor=false, ZIndex=3}, SHeader)
+makeDraggable(S, sDrag)
+local sClose = btn(SHeader, "×", {size=UDim2.fromOffset(36,36), pos=UDim2.new(1,-56,0,13), bg=T.surf2, hoverBg=T.danger, textSize=20, zIndex=4})
+sClose.MouseButton1Click:Connect(function() closeSettings() end)
+
+local STabs = I("Frame", {Size=UDim2.new(1,-40,0,44), Position=UDim2.fromOffset(20,78), BackgroundColor3=T.surface, BorderSizePixel=0}, S)
+round(STabs, 10)
+local sTabGui = btn(STabs, "Интерфейс", {size=UDim2.fromOffset(140,34), pos=UDim2.fromOffset(5,5), bg=T.accent, hoverBg=T.accent2, textSize=13})
+local sTabPlace = btn(STabs, "Доступ", {size=UDim2.fromOffset(150,34), pos=UDim2.fromOffset(150,5), bg=T.surface, hoverBg=T.surf2, textSize=13})
+local sTabPerms = btn(STabs, "Права", {size=UDim2.fromOffset(150,34), pos=UDim2.fromOffset(305,5), bg=T.surface, hoverBg=T.surf2, textSize=13})
+local sTabBlack = btn(STabs, "Blacklist ⭐", {size=UDim2.fromOffset(150,34), pos=UDim2.fromOffset(460,5), bg=T.surface, hoverBg=T.surf2, textSize=13})
+
+local SContent = I("Frame", {Size=UDim2.new(1,-40,1,-140), Position=UDim2.fromOffset(20,130), BackgroundTransparency=1}, S)
+local SGui = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1}, SContent)
+local SPlace = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Visible=false}, SContent)
+local SPerms = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Visible=false}, SContent)
+local SBlack = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Visible=false}, SContent)
+
+local function toggleRow(parent, label, yPos, initialOn, callback)
+    local r = I("Frame", {Size=UDim2.new(1,0,0,44), Position=UDim2.fromOffset(0,yPos), BackgroundColor3=T.surface, BorderSizePixel=0}, parent)
+    round(r, 8); outline(r, T.border, 1)
+    lbl(r, label, {textSize=13, size=UDim2.new(1,-80,1,0), pos=UDim2.fromOffset(14,0)})
+    local on = initialOn or false
+    local tbg = I("Frame", {Size=UDim2.fromOffset(44,24), Position=UDim2.new(1,-60,0.5,-12), BackgroundColor3=on and T.accent or T.surf3, BorderSizePixel=0}, r)
+    round(tbg, 12)
+    local dot = I("Frame", {Size=UDim2.fromOffset(18,18), Position=on and UDim2.fromOffset(23,3) or UDim2.fromOffset(3,3), BackgroundColor3=T.text, BorderSizePixel=0}, tbg)
+    round(dot, 9)
+    I("TextButton", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text="", ZIndex=5}, tbg).MouseButton1Click:Connect(function()
+        on = not on; tbg.BackgroundColor3 = on and T.accent or T.surf3
+        dot.Position = on and UDim2.fromOffset(23,3) or UDim2.fromOffset(3,3)
+        if callback then callback(on) end
+    end)
+end
+
+lbl(SGui, "Настройки интерфейса", {font=Enum.Font.GothamBold, textSize=16, size=UDim2.new(1,0,0,24)})
+toggleRow(SGui, "Тёмная тема", 40, settings.isDark, function(isDark) settings.isDark = isDark; applyTheme(isDark) end)
+toggleRow(SGui, "Аватары", 92, settings.showAvatars, function(on) settings.showAvatars = on end)
+toggleRow(SGui, "Уведомления", 144, settings.showNotifications, function(on) settings.showNotifications = on end)
+toggleRow(SGui, "Автопереподключение", 196, settings.autoReconnect, function(on) settings.autoReconnect = on end)
+
+-- Place access
+lbl(SPlace, "Кто имеет доступ к этому месту", {font=Enum.Font.GothamBold, textSize=16, size=UDim2.new(1,0,0,24)})
+lbl(SPlace, "Пользователи из списка смогут присоединяться без пароля.", {textSize=12, color=T.muted, size=UDim2.new(1,0,0,18), pos=UDim2.fromOffset(0,26)})
+local whitelist = I("Frame", {Size=UDim2.new(1,0,1,-190), Position=UDim2.fromOffset(0,54), BackgroundColor3=T.surface, BorderSizePixel=0}, SPlace)
+round(whitelist, 10); outline(whitelist, T.border, 1); pad(whitelist, 10)
+local wlList = I("Frame", {Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1}, whitelist)
+I("UIListLayout", {Padding=UDim.new(0,8)}, wlList)
+
+local function userRow(uid, name, isHostRow)
+    local r = I("Frame", {Size=UDim2.new(1,0,0,40), BackgroundColor3=T.surf2, BorderSizePixel=0}, wlList)
+    round(r, 8); r:SetAttribute("uid", uid)
+    avatar(r, 28, uid).Position = UDim2.fromOffset(6,6)
+    local nLbl = lbl(r, formatName(uid), {textSize=13, size=UDim2.new(1,-180,1,0), pos=UDim2.fromOffset(44,0)})
+    applyNameStyle(nLbl, uid)
+    if isHostRow then
+        lbl(r, "👑", {font=Enum.Font.GothamBold, textSize=16, color=T.gold, xAlign=Enum.TextXAlignment.Center, size=UDim2.fromOffset(30,26), pos=UDim2.new(1,-100,0.5,-13)})
+        return
+    end
+    local delBtn = btn(r, "Удалить", {size=UDim2.fromOffset(90,26), pos=UDim2.new(1,-100,0.5,-13), bg=T.surface, hoverBg=T.danger, textSize=11})
+    delBtn.MouseButton1Click:Connect(function()
+        local scope = currentWhitelistScope
+        if not scope or not scope.whitelist then return end
+        for i, u in ipairs(scope.whitelist) do if u == uid then table.remove(scope.whitelist, i); break end end
+        r:Destroy()
+    end)
+end
+
+refreshWhitelist = function()
+    for _, ch in ipairs(wlList:GetChildren()) do if ch:IsA("Frame") then ch:Destroy() end end
+    local scope = currentWhitelistScope
+    if not scope or not scope.whitelist then return end
+    local hostUid = scope.hostId or MY_ID
+    for _, uid in ipairs(scope.whitelist) do userRow(uid, formatName(uid), uid == hostUid) end
+end
+
+-- Autocomplete dropdown
+local searchPreview = I("Frame", {Size=UDim2.new(1,0,0,0), Position=UDim2.new(0,0,1,-56), BackgroundColor3=T.surf2, BorderSizePixel=0, Visible=false, ZIndex=10}, SPlace)
+round(searchPreview, 8); outline(searchPreview, T.accent, 1)
+local spLayout = I("UIListLayout", {Padding=UDim.new(0,0)}, searchPreview)
+
+local addRow = I("Frame", {Size=UDim2.new(1,0,0,44), Position=UDim2.new(0,0,1,-50), BackgroundColor3=T.surface, BorderSizePixel=0}, SPlace)
+round(addRow, 8); outline(addRow, T.border, 1); pad(addRow, 6, 10)
+local addBox = I("TextBox", {Size=UDim2.new(1,-140,1,0), BackgroundTransparency=1, BorderSizePixel=0, Font=Enum.Font.Gotham, TextSize=13, TextColor3=T.text, PlaceholderText="ID или ник", PlaceholderColor3=T.muted, Text="", TextXAlignment=Enum.TextXAlignment.Left}, addRow)
+local addBtn = btn(addRow, "Добавить", {size=UDim2.fromOffset(120,32), pos=UDim2.new(1,-120,0.5,-16), bg=T.accent, hoverBg=T.accent2, textSize=12})
+
+local currentSuggestUid = nil
+local currentSuggestName = nil
+local searchDebounce = tick()
+
+addBox:GetPropertyChangedSignal("Text"):Connect(function()
+    searchDebounce = tick()
+    local txt = addBox.Text
+    local myStamp = searchDebounce
+    currentSuggestUid = nil
+    currentSuggestName = nil
+    
+    if txt == "" then searchPreview.Visible = false; return end
+    
+    task.delay(0.4, function()
+        if myStamp ~= searchDebounce then return end
+        local uid = tonumber(txt)
+        local info = nil
+        
+        if uid then
+            info = {uid=uid, name=resolveName(uid)}
+        else
+            local ok, result = pcall(function() return Players:GetUserIdFromNameAsync(txt) end)
+            if ok and result then info = {uid=result, name=txt} end
+        end
+        
+        for _, ch in ipairs(searchPreview:GetChildren()) do if ch:IsA("Frame") then ch:Destroy() end end
+        searchPreview.Visible = true
+        
+        if info then
+            currentSuggestUid = info.uid
+            currentSuggestName = info.name
+            local row = I("Frame", {Size=UDim2.new(1,0,0,40), BackgroundTransparency=1}, searchPreview)
+            avatar(row, 28, info.uid).Position = UDim2.fromOffset(6,6)
+            local n = lbl(row, info.name.."  (ID: "..info.uid..")", {textSize=13, size=UDim2.new(1,-60,1,0), pos=UDim2.fromOffset(44,0)})
+            applyNameStyle(n, info.uid)
+            local cb = I("TextButton", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text="", ZIndex=11}, row)
+            cb.MouseButton1Click:Connect(function()
+                addBox.Text = tostring(info.uid)
+            end)
+        else
+            local row = I("Frame", {Size=UDim2.new(1,0,0,40), BackgroundTransparency=1}, searchPreview)
+            lbl(row, "Не найден: "..txt, {textSize=13, color=T.danger, size=UDim2.new(1,-10,1,0), pos=UDim2.fromOffset(10,0)})
+        end
+        searchPreview.Size = UDim2.new(1, 0, 0, 40)
+    end)
+end)
+
+addBtn.MouseButton1Click:Connect(function()
+    local scope = currentWhitelistScope
+    if not scope or not scope.whitelist then return end
+    local txt = addBox.Text
+    if txt == "" then return end
+    
+    local uid = currentSuggestUid
+    local name = currentSuggestName
+    if not uid then
+        local n = tonumber(txt)
+        if n then uid = n; name = resolveName(n) else
+            local ok, r = pcall(function() return Players:GetUserIdFromNameAsync(txt) end)
+            if ok and r then uid = r; name = txt end
+        end
+    end
+    
+    if not uid then showToast(S, "Пользователь не найден", T.danger); return end
+    for _, u in ipairs(scope.whitelist) do if u == uid then showToast(S, "Уже в списке", T.warn); return end end
+    
+    table.insert(scope.whitelist, uid)
+    refreshWhitelist()
+    addBox.Text = ""
+    searchPreview.Visible = false
+    currentSuggestUid = nil
+    currentSuggestName = nil
+end)
+
+-- Perms
+lbl(SPerms, "Права участников", {font=Enum.Font.GothamBold, textSize=16, size=UDim2.new(1,0,0,24)})
+local permsBody = I("Frame", {Size=UDim2.new(1,0,1,-130), Position=UDim2.fromOffset(0,54), BackgroundColor3=T.surface, BorderSizePixel=0}, SPerms)
+round(permsBody, 10); outline(permsBody, T.border, 1); pad(permsBody, 10)
+local permList = I("Frame", {Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1}, permsBody)
+I("UIListLayout", {Padding=UDim.new(0,8)}, permList)
+
+local permNames = {"Редакт.", "Удалять", "Двигать", "Добавлять"}
+local permRow = function(uid, name, defaults, isHostRow)
+    local r = I("Frame", {Size=UDim2.new(1,0,0,52), BackgroundColor3=T.surf2, BorderSizePixel=0}, permList)
+    round(r, 8)
+    avatar(r, 28, uid).Position = UDim2.fromOffset(6,12)
+    local nLbl = lbl(r, formatName(uid), {textSize=13, size=UDim2.new(1,-360,1,0), pos=UDim2.fromOffset(44,0), truncate=true})
+    applyNameStyle(nLbl, uid)
+    
+    if isHostRow then
+        lbl(r, "👑", {font=Enum.Font.GothamBold, textSize=16, color=T.gold, xAlign=Enum.TextXAlignment.Left, size=UDim2.fromOffset(28,26), pos=UDim2.new(1,-360,0.5,-13)})
+    elseif isOwnLobby and uid ~= MY_ID then
+        local kickBtn = btn(r, "Кикнуть", {size=UDim2.fromOffset(78,24), pos=UDim2.new(1,-360,0.5,-12), bg=T.surface, hoverBg=T.danger, textSize=11})
+        kickBtn.MouseButton1Click:Connect(function() kickPlayer(uid) end)
+    end
+    
+    local cbox = I("Frame", {Size=UDim2.new(0,270,1,0), Position=UDim2.new(1,-270,0,0), BackgroundTransparency=1}, r)
+    I("UIListLayout", {FillDirection=Enum.FillDirection.Horizontal, Padding=UDim.new(0,6), VerticalAlignment=Enum.VerticalAlignment.Center, HorizontalAlignment=Enum.HorizontalAlignment.Right}, cbox)
+    
+    for i, pname in ipairs(permNames) do
+        local on = (defaults and defaults[i]) or false
+        local chip = I("Frame", {Size=UDim2.fromOffset(62,26), BackgroundColor3=on and T.success or T.surf3, BorderSizePixel=0}, cbox)
+        round(chip, 6)
+        lbl(chip, pname, {textSize=10, xAlign=Enum.TextXAlignment.Center, color=on and Color3.new(1,1,1) or T.muted, size=UDim2.fromScale(1,1)})
+        local cb = I("TextButton", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text="", ZIndex=5}, chip)
+        local isOn = on
+        cb.MouseButton1Click:Connect(function()
+            isOn = not isOn
+            chip.BackgroundColor3 = isOn and T.success or T.surf3
+            chip:FindFirstChildOfClass("TextLabel").TextColor3 = isOn and Color3.new(1,1,1) or T.muted
+        end)
+    end
+end
+
+refreshPerms = function()
+    for _, ch in ipairs(permList:GetChildren()) do if ch:IsA("Frame") then ch:Destroy() end end
+    if not State.session then return end
+    local players = State.remotePlayers
+    if #players == 0 then players = {{userId=MY_ID, userName=MY_NAME, isHost=isOwnLobby, roles=MY_ROLES}} end
+    for _, p in ipairs(players) do
+        local isHostRow = p.isHost or (currentLobby and currentLobby.hostId == p.userId)
+        permRow(p.userId, formatName(p.userId), {true, true, true, true}, isHostRow)
+    end
+end
+
+-- Blacklist
+local blacklistBody = I("Frame", {Size=UDim2.new(1,0,1,-130), Position=UDim2.fromOffset(0,54), BackgroundColor3=T.surface, BorderSizePixel=0}, SBlack)
+round(blacklistBody, 10); outline(blacklistBody, T.border, 1); pad(blacklistBody, 10)
+local blList = I("Frame", {Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1}, blacklistBody)
+I("UIListLayout", {Padding=UDim.new(0,6)}, blList)
+
+local blInputRow = I("Frame", {Size=UDim2.new(1,0,0,44), Position=UDim2.new(0,0,1,-50), BackgroundColor3=T.surface, BorderSizePixel=0}, SBlack)
+round(blInputRow, 8); outline(blInputRow, T.border, 1); pad(blInputRow, 6, 10)
+local blBox = I("TextBox", {Size=UDim2.new(1,-140,1,0), BackgroundTransparency=1, BorderSizePixel=0, Font=Enum.Font.Gotham, TextSize=13, TextColor3=T.text, PlaceholderText="ID или ник", PlaceholderColor3=T.muted, Text="", TextXAlignment=Enum.TextXAlignment.Left}, blInputRow)
+local blAddBtn = btn(blInputRow, "Забанить", {size=UDim2.fromOffset(120,32), pos=UDim2.new(1,-120,0.5,-16), bg=T.danger, hoverBg=Color3.fromRGB(255,120,120), textSize=12})
+
+local function rebuildBlacklistUI()
+    for _, ch in ipairs(blList:GetChildren()) do if ch:IsA("Frame") then ch:Destroy() end end
+    for key, val in pairs(State.blacklist) do
+        if val then
+            local r = I("Frame", {Size=UDim2.new(1,0,0,36), BackgroundColor3=T.surf2, BorderSizePixel=0}, blList)
+            round(r, 6)
+            lbl(r, key, {textSize=13, size=UDim2.new(1,-100,1,0), pos=UDim2.fromOffset(10,0)})
+            local delBtn = btn(r, "Удалить", {size=UDim2.fromOffset(80,26), pos=UDim2.new(1,-90,0.5,-13), bg=T.surface, hoverBg=T.danger, textSize=11})
+            delBtn.MouseButton1Click:Connect(function()
+                State.blacklist[key] = nil
+                saveBlacklist()
+                rebuildBlacklistUI()
+            end)
+        end
+    end
+end
+
+blAddBtn.MouseButton1Click:Connect(function()
+    local txt = blBox.Text
+    if txt == "" then return end
+    State.blacklist[txt] = true
+    saveBlacklist()
+    blBox.Text = ""
+    rebuildBlacklistUI()
+end)
+
+local function switchSTab(which)
+    SGui.Visible = (which == "gui"); SPlace.Visible = (which == "place"); SPerms.Visible = (which == "perms"); SBlack.Visible = (which == "black")
+    sTabGui.BackgroundColor3 = (which == "gui") and T.accent or T.surface
+    sTabPlace.BackgroundColor3 = (which == "place") and T.accent or T.surface
+    sTabPerms.BackgroundColor3 = (which == "perms") and T.accent or T.surface
+    sTabBlack.BackgroundColor3 = (which == "black") and T.accent or T.surface
+end
+
+sTabGui.MouseButton1Click:Connect(function() switchSTab("gui") end)
+sTabPlace.MouseButton1Click:Connect(function() refreshWhitelist(); switchSTab("place") end)
+sTabPerms.MouseButton1Click:Connect(function() refreshPerms(); switchSTab("perms") end)
+sTabBlack.MouseButton1Click:Connect(function() rebuildBlacklistUI(); switchSTab("black") end)
+
+local openSettings = function(context)
+    previousScreen = lastVisibleFrame
+    Main.Visible = false; InPlace.Visible = false; S.Visible = true
+    lastVisibleFrame = S
+    if context == "main" then currentWhitelistScope = State.myPlace
+    elseif context == "inplace" and isOwnLobby and currentLobby then currentWhitelistScope = currentLobby
+    else currentWhitelistScope = nil end
+    
+    local isOwnerRole = MY_ROLES and MY_ROLES.isOwner
+    sTabPlace.Visible = (currentWhitelistScope ~= nil)
+    sTabPerms.Visible = (context == "inplace" and isOwnLobby)
+    sTabBlack.Visible = isOwnerRole
+    switchSTab("gui")
+end
+settingsBtn.MouseButton1Click:Connect(function() openSettings("main") end)
+
+--==================================================================
+-- IN-PLACE
+--==================================================================
+InPlace = I("Frame", {Name="InPlaceFrame", Size=UDim2.fromOffset(860,600), Position=UDim2.new(0.5,-430,0.5,-300), BackgroundColor3=T.bg, BorderSizePixel=0, Visible=false}, root)
+round(InPlace, 14); outline(InPlace, T.border, 1)
+local IPHeader = I("Frame", {Size=UDim2.new(1,0,0,62), BackgroundColor3=T.surface, BorderSizePixel=0}, InPlace)
+round(IPHeader, 14)
+local ipStatusLbl = lbl(IPHeader, "● Активно", {font=Enum.Font.GothamBold, textSize=15, color=T.success, size=UDim2.fromOffset(300,26), pos=UDim2.fromOffset(20,18), zIndex=2})
+local ipSubtitleLbl = lbl(IPHeader, "—", {textSize=12, color=T.muted, size=UDim2.fromOffset(400,16), pos=UDim2.fromOffset(20,38), zIndex=2})
+local ipDrag = I("TextButton", {Size=UDim2.new(1,-348,1,0), BackgroundTransparency=1, BorderSizePixel=0, Text="", AutoButtonColor=false, ZIndex=3}, IPHeader)
+makeDraggable(InPlace, ipDrag)
+
+local exitBtn = btn(IPHeader, "Выйти", {size=UDim2.fromOffset(200,34), pos=UDim2.new(1,-340,0,14), bg=T.danger, hoverBg=Color3.fromRGB(250,120,120), textSize=12, zIndex=4})
+local ipLogsBtn = btn(IPHeader, "📋", {size=UDim2.fromOffset(36,36), pos=UDim2.new(1,-134,0,13), bg=T.surf2, hoverBg=T.border, textSize=18, zIndex=4})
+local ipSettingsBtn = btn(IPHeader, "⚙", {size=UDim2.fromOffset(36,36), pos=UDim2.new(1,-94,0,13), bg=T.surf2, hoverBg=T.border, textSize=18, zIndex=4})
+local ipMinimizeBtn = btn(IPHeader, "–", {size=UDim2.fromOffset(36,36), pos=UDim2.new(1,-54,0,13), bg=T.surf2, hoverBg=T.border, textSize=18, zIndex=4})
+local ipCloseBtn = btn(IPHeader, "×", {size=UDim2.fromOffset(36,36), pos=UDim2.new(1,-14,0,13), bg=T.surf2, hoverBg=T.danger, textSize=20, zIndex=4})
+
+ipLogsBtn.MouseButton1Click:Connect(toggleLogs)
+ipSettingsBtn.MouseButton1Click:Connect(function() openSettings("inplace") end)
+ipMinimizeBtn.MouseButton1Click:Connect(function()
+    InPlace.Visible = false
+    minimizedBtn.Visible = true
+end)
+ipCloseBtn.MouseButton1Click:Connect(function() root.Enabled = false end)
+
+local IPBody = I("Frame", {Size=UDim2.new(1,-40,1,-82), Position=UDim2.fromOffset(20,72), BackgroundTransparency=1}, InPlace)
+local PlayersPane = I("Frame", {Size=UDim2.new(0,300,1,0), BackgroundColor3=T.surface, BorderSizePixel=0}, IPBody)
+round(PlayersPane, 10); outline(PlayersPane, T.border, 1); pad(PlayersPane, 12)
+lbl(PlayersPane, "Участники", {font=Enum.Font.GothamBold, textSize=14, size=UDim2.new(1,0,0,22)})
+local pList = I("Frame", {Size=UDim2.new(1,0,1,-30), Position=UDim2.fromOffset(0,30), BackgroundTransparency=1}, PlayersPane)
+I("UIListLayout", {Padding=UDim.new(0,6)}, pList)
+
+kickPlayer = function(uid)
+    if not State.session or not isOwnLobby then return end
+    pcall(function() State.wsClient:Send(HttpService:JSONEncode({type="kick", targetUserId=uid})) end)
+end
+
+refreshPlayerList = function()
+    for _, ch in ipairs(pList:GetChildren()) do if ch:IsA("Frame") then ch:Destroy() end end
+    local players = State.remotePlayers
+    if #players == 0 then players = {{userId=MY_ID, userName=MY_NAME, isHost=isOwnLobby, roles=MY_ROLES}} end
+    for _, p in ipairs(players) do
+        local row = I("Frame", {Size=UDim2.new(1,0,0,44), BackgroundColor3=T.surf2, BorderSizePixel=0}, pList)
+        round(row, 8)
+        avatar(row, 28, p.userId).Position = UDim2.fromOffset(6,8)
+        local nLbl = lbl(row, formatName(p.userId), {textSize=13, size=UDim2.new(1,-140,0,18), pos=UDim2.fromOffset(42,6), truncate=true})
+        applyNameStyle(nLbl, p.userId)
+        if isOwnLobby and p.userId ~= MY_ID then
+            local kickBtn = btn(row, "Кикнуть", {size=UDim2.fromOffset(80,24), pos=UDim2.new(1,-88,0.5,-12), bg=T.surface, hoverBg=T.danger, textSize=11, zIndex=5})
+            kickBtn.MouseButton1Click:Connect(function() kickPlayer(p.userId) end)
+        end
+    end
+end
+_G.__collabsync_refresh_players = refreshPlayerList
+
+local ChatPane = I("Frame", {Size=UDim2.new(1,-320,1,0), Position=UDim2.fromOffset(320,0), BackgroundColor3=T.surface, BorderSizePixel=0}, IPBody)
+round(ChatPane, 10); outline(ChatPane, T.border, 1); pad(ChatPane, 12)
+lbl(ChatPane, "Чат", {font=Enum.Font.GothamBold, textSize=14, size=UDim2.new(1,0,0,22)})
+local ChatScroll = I("ScrollingFrame", {Size=UDim2.new(1,0,1,-76), Position=UDim2.fromOffset(0,30), BackgroundTransparency=1, BorderSizePixel=0, CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y, ScrollBarThickness=6, ScrollBarImageColor3=T.border}, ChatPane)
+I("UIListLayout", {Padding=UDim.new(0,8), SortOrder=Enum.SortOrder.LayoutOrder}, ChatScroll)
+
+local function addMessageToUI(authorUid, authorName, text)
+    local outer = I("Frame", {Size=UDim2.new(1, 0, 0, 0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1}, ChatScroll)
+    I("UIListLayout", {FillDirection=Enum.FillDirection.Horizontal, Padding=UDim.new(0, 8), SortOrder=Enum.SortOrder.LayoutOrder, VerticalAlignment=Enum.VerticalAlignment.Top}, outer)
+    avatar(outer, 28, authorUid).LayoutOrder = 1
+    local colFrame = I("Frame", {Size=UDim2.new(1, -36, 0, 0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1, LayoutOrder=2}, outer)
+    I("UIListLayout", {Padding=UDim.new(0, 2), SortOrder=Enum.SortOrder.LayoutOrder}, colFrame)
+    local aLbl = I("TextLabel", {Size=UDim2.new(1,0,0,16), BackgroundTransparency=1, Font=Enum.Font.GothamBold, TextSize=11, TextXAlignment=Enum.TextXAlignment.Left, Text=formatName(authorUid)}, colFrame)
+    applyNameStyle(aLbl, authorUid)
+    I("TextLabel", {Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=13, TextColor3=T.text, TextWrapped=true, TextXAlignment=Enum.TextXAlignment.Left, Text=text}, colFrame)
+    task.defer(function() task.wait(0.1); ChatScroll.CanvasPosition = Vector2.new(0, math.max(0, ChatScroll.CanvasSize.Y.Offset - ChatScroll.AbsoluteWindowSize.Y)) end)
+end
+
+local chatInput = I("Frame", {Size=UDim2.new(1,0,0,40), Position=UDim2.new(0,0,1,-40), BackgroundColor3=T.surf2, BorderSizePixel=0}, ChatPane)
+round(chatInput, 8); pad(chatInput, 6, 10)
+local ciBox = I("TextBox", {Size=UDim2.new(1,-90,1,0), BackgroundTransparency=1, BorderSizePixel=0, Font=Enum.Font.Gotham, TextSize=13, TextColor3=T.text, Text="", PlaceholderText="Написать...", PlaceholderColor3=T.muted, TextXAlignment=Enum.TextXAlignment.Left, ClearTextOnFocus=false}, chatInput)
+local sendBtn = btn(chatInput, "➤", {size=UDim2.fromOffset(70,28), pos=UDim2.new(1,-70,0.5,-14), bg=T.accent, hoverBg=T.accent2, textSize=14})
+
+local function sendChat()
+    local txt = ciBox.Text
+    if txt == "" or not State.connected then return end
+    State.wsClient:Send(HttpService:JSONEncode({type="chat", text=txt, userId=MY_ID, userName=MY_NAME}))
+    ciBox.Text = ""
+end
+sendBtn.MouseButton1Click:Connect(sendChat)
+ciBox.FocusLost:Connect(function(enter) if enter then sendChat() end end)
+
+-- Minimized button
+minimizedBtn = I("TextButton", {Size=UDim2.fromOffset(196,44), Position=UDim2.new(1,-216,1,-64), BackgroundColor3=T.surface, Text="CollabSync ▲", TextColor3=T.text, Font=Enum.Font.GothamBold, TextSize=13, BorderSizePixel=0, Visible=false, ZIndex=200}, root)
+round(minimizedBtn, 10); outline(minimizedBtn, T.accent, 1)
+local function restoreGUI()
+    minimizedBtn.Visible = false
+    local target = lastVisibleFrame or Main
+    if not target or not target.Parent then target = Main end
+    target.Visible = true; lastVisibleFrame = target
+end
+minimizedBtn.MouseButton1Click:Connect(restoreGUI)
+
+--==================================================================
+-- WebSocket & Session
+--==================================================================
+connectWebSocket = function(hostUrl, token, isHost, onReady, onFail, isReconnect)
+    if State.connecting then return end
+    State.connecting = true
+    if State.reconnectTask then pcall(task.cancel, State.reconnectTask); State.reconnectTask = nil end
+    if State.wsClient then
+        local old = State.wsClient; State.wsClient = nil
+        pcall(function() old:Close() end)
+        task.wait(0.1)
+    end
+    State.connected = false
+    State.synced = false
+    State.pendingChunks = {}
+    State.isReconnect = isReconnect or false
+    
+    local wsUrl = hostUrl
+    if wsUrl:match("^https://") then wsUrl = "wss://"..wsUrl:sub(9) end
+    if wsUrl:match("^http://") then wsUrl = "ws://"..wsUrl:sub(8) end
+    wsUrl = wsUrl:gsub("/+$", "")
+    if not wsUrl:match("/ws$") then wsUrl = wsUrl.."/ws" end
+    
+    logMsg("plugin", "info", "WS: "..wsUrl..(isReconnect and " (reconnect)" or ""))
+    
+    local ok, client = pcall(function() return HttpService:CreateWebStreamClient(Enum.WebStreamClientType.WebSocket, {Url=wsUrl}) end)
+    if not ok or not client then State.connecting = false; onFail("Ошибка WS: "..tostring(client)); return end
+    
+    State.wsClient = client
+    local readyCalled = false
+    local snapshotSent = false
+    
+    client.Opened:Connect(function()
+        State.connecting = false
+        State.connected = true
+        pcall(function() client:Send(HttpService:JSONEncode({type="hello", token=token, userId=MY_ID, userName=MY_NAME})) end)
+    end)
+    
+    client.MessageReceived:Connect(function(msg)
+        local ok, data = pcall(function() return HttpService:JSONDecode(msg) end)
+        if not ok or type(data) ~= "table" then return end
+        
+        if data.type == "welcome" then
+            State.connected = true; State.lastAck = tick()
+            State.remotePlayers = data.players or {}
+            State.pendingChunks = {}
+            State.synced = false
+            pcall(refreshPlayerList)
+            
+            -- Send our roles (fetched from server1) so others see correct roles
+            pcall(function() client:Send(HttpService:JSONEncode({type="roles", roles=MY_ROLES})) end)
+            
+            for uid in pairs(State.localMarkers) do if uid ~= MY_ID then destroyLocalMarker(uid) end end
+            -- Markers are NOT created here. They'll be created after snapshot or timeout.
+            
+            if isHost and not snapshotSent then
+                snapshotSent = true
+                task.spawn(function()
+                    local snap = buildSnapshot()
+                    logMsg("lobby", "info", "Снапшот: "..#snap)
+                    pcall(function() client:Send(HttpService:JSONEncode({type="snapshot", data=snap})) end)
+                end)
+            end
+            
+            -- If we're host, we can consider ourselves synced immediately (we built the snapshot)
+            if isHost then
+                State.synced = true
+                task.defer(processPendingMarkers)
+            else
+                -- Guest: wait for snapshot_chunk or timeout
+                task.delay(SYNC_TIMEOUT, function()
+                    if State.connected and not State.synced then
+                        logMsg("lobby", "warn", "Синк таймаут, помечаем как синхронизировано")
+                        State.synced = true
+                        processPendingMarkers()
+                    end
+                end)
+            end
+            
+            task.delay(3, function()
+                if State.connected and State.session then
+                    local hostFound = false
+                    for _, p in ipairs(State.remotePlayers) do if p.isHost then hostFound = true; break end end
+                    if not hostFound then
+                        logMsg("lobby", "warn", "Хост не найден, выход")
+                        exitLobbyUI()
+                    end
+                end
+            end)
+            
+            if not readyCalled then readyCalled = true; if onReady then pcall(onReady) end end
+            
+        elseif data.type == "snapshot_chunk" then
+            table.insert(State.pendingChunks, {chunk=data.chunk, index=data.index or 0})
+            local total = 0
+            for _, c in ipairs(State.pendingChunks) do total = total + #c.chunk end
+            if total >= (data.total or 0) then
+                local allItems = {}
+                table.sort(State.pendingChunks, function(a, b) return a.index < b.index end)
+                for _, c in ipairs(State.pendingChunks) do
+                    for _, item in ipairs(c.chunk) do table.insert(allItems, item) end
+                end
+                State.pendingChunks = {}
+                task.spawn(function()
+                    State.applyingSnapshot = true
+                    local hostIds = {}
+                    for i, item in ipairs(allItems) do
+                        hostIds[item.id] = true
+                        applyDelta({kind="create", id=item.id, parentId=item.parentId, className=item.className, name=item.name, props=item.props, attrs=item.attrs})
+                        if i % APPLY_CHUNK == 0 then task.wait(APPLY_CHUNK_DELAY) end
+                    end
+                    task.wait(0.3)
+                    local removed = 0
+                    for id, inst in pairs(State.objectMap) do
+                        if not hostIds[id] and inst and inst.Parent then
+                            pcall(function() inst:Destroy() end)
+                            State.objectMap[id] = nil
+                            removed = removed + 1
+                        end
+                    end
+                    logMsg("lobby", "info", "Снапшот: "..#allItems..", удалено: "..removed)
+                    State.synced = true
+                    task.delay(0.5, function() State.applyingSnapshot = false end)
+                    processPendingMarkers()
+                end)
+            end
+            
+        elseif data.type == "history" then
+            task.spawn(function()
+                for _, delta in ipairs(data.data or {}) do
+                    if delta.kind ~= "camera" then applyDelta(delta) end
+                end
+            end)
+            
+        elseif data.type == "delta" then
+            applyDelta(data)
+            
+        elseif data.type == "chat" then
+            addMessageToUI(data.userId, data.userName, data.text)
+            logMsg("lobby", "info", "Чат: "..data.userName..": "..data.text)
+            
+        elseif data.type == "players" then
+            State.remotePlayers = data.players or {}
+            pcall(refreshPlayerList)
+            local found = false
+            for _, p in ipairs(State.remotePlayers) do if p.userId == MY_ID then found = true; break end end
+            if not found and #State.remotePlayers > 0 then
+                logMsg("lobby", "error", "Меня нет в списке")
+                task.defer(function() exitLobbyUI() end)
+                return
+            end
+            local active = {}
+            for _, p in ipairs(State.remotePlayers) do
+                active[p.userId] = true
+                if p.roles then roleCache[p.userId] = p.roles end
+            end
+            for uid in pairs(State.localMarkers) do if not active[uid] then destroyLocalMarker(uid) end end
+            -- Only create markers if synced
+            if State.synced then
+                for _, p in ipairs(State.remotePlayers) do
+                    if p.userId ~= MY_ID and not State.localMarkers[p.userId] then
+                        createLocalMarker(p.userId, p.userName)
+                    end
+                end
+                for uid in pairs(State.localMarkers) do refreshMarkerStyle(uid) end
+            end
+            
+        elseif data.type == "heartbeat_ack" then
+            State.lastAck = tick()
+            
+        elseif data.type == "kicked" then
+            logMsg("lobby", "warn", "Вас исключили")
+            showToast(InPlace, "Вас исключили", T.danger)
+            task.defer(function() exitLobbyUI() end)
+            
+        elseif data.type == "host_left" then
+            logMsg("lobby", "warn", "Хост вышел, лобби закрыто")
+            showToast(InPlace, "Хост вышел", T.danger)
+            task.defer(function() exitLobbyUI() end)
+            
+        elseif data.type == "error" then
+            logMsg("lobby", "error", data.message or "server error")
+            if data.message and data.message:match("host") then
+                showToast(InPlace, "Хост недоступен", T.danger)
+                task.defer(function() exitLobbyUI() end)
+            end
+        end
+    end)
+    
+    client.Closed:Connect(function()
+        if State.wsClient ~= client then return end
+        State.connected = false; State.connecting = false; State.synced = false
+        logMsg("plugin", "warn", "WS закрыт")
+        if settings.autoReconnect and State.session then
+            if State.reconnectTask then pcall(task.cancel, State.reconnectTask) end
+            State.reconnectTask = task.delay(RECONNECT_DELAY, function()
+                State.reconnectTask = nil
+                if State.session and not State.connecting then
+                    connectWebSocket(State.session.hostUrl, State.session.token, State.session.isHost, function() end, function() end, true)
+                end
+            end)
+        end
+    end)
+    
+    client.Error:Connect(function(code, err)
+        logMsg("plugin", "error", "WS: "..tostring(err))
+        State.connecting = false
+        if not readyCalled then readyCalled = true; pcall(onFail, "Ошибка: "..tostring(err)) end
+    end)
+    
+    task.delay(WS_TIMEOUT, function()
+        if State.connecting then
+            State.connecting = false
+            if not readyCalled then readyCalled = true; pcall(onFail, "Таймаут") end
+        end
+    end)
+end
+
+startHeartbeat = function()
+    if State.heartbeatThread then task.cancel(State.heartbeatThread) end
+    State.heartbeatThread = task.spawn(function()
+        while State.session do
+            if State.wsClient then pcall(function() State.wsClient:Send(HttpService:JSONEncode({type="heartbeat", userId=MY_ID})) end) end
+            if State.session.lobbyId and State.session.lobbyId ~= "direct" then
+                pcall(function() httpJson(CATALOG_URL.."/api/lobby/heartbeat", "POST", {lobbyId=State.session.lobbyId}) end)
+            end
+            task.wait(HEARTBEAT_INTERVAL)
+        end
+    end)
+end
+
+stopSession = function()
+    if State.heartbeatThread then task.cancel(State.heartbeatThread); State.heartbeatThread = nil end
+    if State.catalogPollThread then task.cancel(State.catalogPollThread); State.catalogPollThread = nil end
+    if State.reconnectTask then pcall(task.cancel, State.reconnectTask); State.reconnectTask = nil end
+    State.session = nil
+    if State.wsClient then
+        local old = State.wsClient; State.wsClient = nil
+        pcall(function() old:Send(HttpService:JSONEncode({type="leave", userId=MY_ID})); old:Close() end)
+    end
+    State.connected = false; State.connecting = false; State.synced = false
+    for uid in pairs(State.localMarkers) do destroyLocalMarker(uid) end
+end
+
+exitLobbyUI = function()
+    if State.session and State.session.isHost then
+        pcall(function() httpJson(CATALOG_URL.."/api/lobby/delete", "POST", {lobbyId=State.session.lobbyId, userId=MY_ID}) end)
+    end
+    stopSession()
+    InPlace.Visible = false
+    Main.Visible = true
+    lastVisibleFrame = Main
+    currentLobby = nil
+    isOwnLobby = false
+end
+
+exitBtn.MouseButton1Click:Connect(function()
+    if State.session then
+        exitLobbyUI()
+    else
+        InPlace.Visible = false
+        Main.Visible = true
+        lastVisibleFrame = Main
+    end
+end)
+
+--==================================================================
+-- Catalog / Cards / Join / Publish
+--==================================================================
+card = function(placeName, lobbyName, players, opts)
+    local c = I("Frame", {Size=UDim2.new(1,0,0,92), BackgroundColor3=T.surface, BorderSizePixel=0})
+    round(c, 12); outline(c, T.border, 1); pad(c, 12)
+    
+    local f = I("Frame", {Size=UDim2.fromOffset(64,64), BackgroundColor3=T.surf3, BorderSizePixel=0}, c)
+    round(f, 10); outline(f, T.border, 1)
+    
+    if not opts.confidential then
+        local img = I("ImageLabel", {
+            Size=UDim2.fromScale(1,1), BackgroundTransparency=1,
+            Image="rbxthumb://type=GameIcon&id="..tostring(opts.placeId or 142823291).."&w=150&h=150",
+            ScaleType=Enum.ScaleType.Crop
+        }, f)
+        round(img, 10)
+    else
+        lbl(f, "🔒", {textSize=24, xAlign=Enum.TextXAlignment.Center, yAlign=Enum.TextYAlignment.Center, size=UDim2.fromScale(1,1)})
+    end
+    
+    lbl(c, placeName or "Unknown Place", {font=Enum.Font.GothamBold, textSize=14, size=UDim2.new(1,-80,0,20), pos=UDim2.fromOffset(76,8)})
+    lbl(c, lobbyName or "Lobby", {textSize=12, color=T.muted, size=UDim2.new(1,-80,0,18), pos=UDim2.fromOffset(76,30)})
+    lbl(c, "Хост: " .. (opts.hostName or "Unknown"), {textSize=11, color=T.muted, size=UDim2.new(1,-80,0,16), pos=UDim2.fromOffset(76,50)})
+    
+    local joinBtn = btn(c, "Войти", {size=UDim2.fromOffset(80,32), pos=UDim2.new(1,-80,0.5,-16), bg=T.accent, hoverBg=T.accent2, textSize=12})
+    
+    joinBtn.MouseButton1Click:Connect(function()
+        if opts.confidential then
+            promptPassword(function(pass)
+                attemptJoin(opts.lobbyId, pass, opts.hostName)
+            end)
+        else
+            attemptJoin(opts.lobbyId, nil, opts.hostName)
+        end
+    end)
+    
+    return c
+end
+
+attemptJoin = function(lobbyId, password, hostName)
+    showToast(Main, "Подключение...", T.accent)
+    local ok, res = httpJson(CATALOG_URL.."/api/lobby/join", "POST", {
+        lobbyId = lobbyId,
+        userId = MY_ID,
+        userName = MY_NAME,
+        password = password
+    })
+    
+    if ok and res and res.token then
+        State.session = {
+            lobbyId = res.lobbyId,
+            token = res.token,
+            hostUrl = res.hostUrl,
+            isHost = false
+        }
+        isOwnLobby = false
+        currentLobby = {
+            id = res.lobbyId,
+            hostId = res.hostId or 0,
+            hostName = hostName or "Unknown",
+            whitelist = {}
+        }
+        currentWhitelistScope = currentLobby
+        
+        showLoadingSteps("Подключение к лобби", {
+            {label = "Подключение к серверу...", fn = function()
+                local ready = false
+                local err = nil
+                connectWebSocket(State.session.hostUrl, State.session.token, false, 
+                    function() ready = true end, 
+                    function(e) err = e end
+                )
+                local t = tick()
+                while not ready and not err and tick() - t < 15 do task.wait(0.1) end
+                if err then error(err) end
+                if not ready then error("Таймаут подключения") end
+                return true
+            end},
+        }, function()
+            Main.Visible = false
+            InPlace.Visible = true
+            lastVisibleFrame = InPlace
+            ipStatusLbl.Text = "● Активно (Гость)"
+            ipSubtitleLbl.Text = currentLobby.hostName .. " | " .. currentLobby.id
+            startHeartbeat()
+            showToast(InPlace, "Вы в лобби!", T.success)
+        end, function(err)
+            showToast(Main, "Ошибка: " .. tostring(err), T.danger)
+            State.session = nil
+        end)
+    else
+        showToast(Main, "Ошибка: " .. tostring(res and res.error or "Неизвестно"), T.danger)
+    end
+end
+
+publishLobby = function()
+    local name = createNameBox.Text
+    if name == "" then showToast(Create, "Введите название", T.danger); return end
+    local pass = createPassBox.Text
+    local hostUrl = createServ2Box.Text
+    if hostUrl == "" then hostUrl = DEFAULT_HOST_URL end
+    
+    showToast(Create, "Создание лобби...", T.accent)
+    
+    local ok, res = httpJson(CATALOG_URL.."/api/lobby/create", "POST", {
+        name = name,
+        hostId = MY_ID,
+        hostName = MY_NAME,
+        password = pass ~= "" and pass or nil,
+        isPrivate = confOn,
+        hostUrl = hostUrl,
+        placeId = game.PlaceId,
+        placeName = game.Name
+    })
+    
+    if ok and res and res.lobbyId and res.token then
+        State.session = {
+            lobbyId = res.lobbyId,
+            token = res.token,
+            hostUrl = res.hostUrl or hostUrl,
+            isHost = true
+        }
+        isOwnLobby = true
+        currentLobby = {
+            id = res.lobbyId,
+            hostId = MY_ID,
+            hostName = MY_NAME,
+            whitelist = {}
+        }
+        currentWhitelistScope = currentLobby
+        
+        showLoadingSteps("Подключение к лобби", {
+            {label = "Подключение к серверу...", fn = function()
+                local ready = false
+                local err = nil
+                connectWebSocket(State.session.hostUrl, State.session.token, true, 
+                    function() ready = true end, 
+                    function(e) err = e end
+                )
+                local t = tick()
+                while not ready and not err and tick() - t < 15 do task.wait(0.1) end
+                if err then error(err) end
+                if not ready then error("Таймаут подключения к WS") end
+                return true
+            end},
+            {label = "Отправка снапшота...", fn = function() task.wait(0.5); return true end},
+        }, function()
+            Main.Visible = false
+            InPlace.Visible = true
+            lastVisibleFrame = InPlace
+            ipStatusLbl.Text = "● Активно (Хост)"
+            ipSubtitleLbl.Text = game.Name .. " | " .. currentLobby.id
+            startHeartbeat()
+            showToast(InPlace, "Лобби создано!", T.success)
+        end, function(err)
+            showToast(Create, "Ошибка: " .. tostring(err), T.danger)
+            State.session = nil
+        end)
+    else
+        showToast(Create, "Ошибка: " .. tostring(res and res.error or "Неизвестно"), T.danger)
+    end
+end
+publishBtn.MouseButton1Click:Connect(publishLobby)
+
+directConnect = function()
+    local url = directUrlBox.Text
+    local token = directTokenBox.Text
+    if url == "" or token == "" then showToast(Direct, "Заполните URL и токен", T.danger); return end
+    
+    State.session = { lobbyId = "direct", token = token, hostUrl = url, isHost = false }
+    isOwnLobby = false
+    currentLobby = { id = "direct", hostId = 0, hostName = "Direct", whitelist = {} }
+    
+    showLoadingSteps("Прямое подключение", {
+        {label = "Подключение...", fn = function()
+            local ready = false
+            local err = nil
+            connectWebSocket(url, token, false, function() ready = true end, function(e) err = e end)
+            local t = tick()
+            while not ready and not err and tick() - t < 15 do task.wait(0.1) end
+            if err then error(err) end
+            if not ready then error("Таймаут") end
+            return true
+        end}
+    }, function()
+        Main.Visible = false; InPlace.Visible = true; lastVisibleFrame = InPlace
+        ipStatusLbl.Text = "● Прямое подключение"
+        ipSubtitleLbl.Text = url
+        startHeartbeat()
+    end, function(err)
+        showToast(Direct, "Ошибка: " .. tostring(err), T.danger)
+        State.session = nil
+    end)
+end
+directBtn.MouseButton1Click:Connect(directConnect)
+
+startCatalogPoll = function()
+    if State.catalogPollThread then task.cancel(State.catalogPollThread) end
+    State.catalogPollThread = task.spawn(function()
+        while true do
+            if not State.session then
+                local ok, res = httpJson(CATALOG_URL.."/api/lobby/list", "GET")
+                if ok and res and res.lobbies then
+                    State.remoteLobbies = res.lobbies
+                    for _, ch in ipairs(aList:GetChildren()) do if ch:IsA("Frame") then ch:Destroy() end end
+                    for _, ch in ipairs(aListAll:GetChildren()) do if ch:IsA("Frame") then ch:Destroy() end end
+                    
+                    local myLobbies = {}
+                    for _, l in ipairs(State.remoteLobbies) do
+                        if l.hostId == MY_ID then table.insert(myLobbies, l) end
+                    end
+                    
+                    if #myLobbies > 0 then
+                        for _, l in ipairs(myLobbies) do
+                            local c = card(l.placeName or "Unknown", l.name, 0, {placeId=l.placeId, confidential=false, hostName=l.hostName, lobbyId=l.id})
+                            c.Parent = aList
+                        end
+                    else
+                        lbl(aList, "Нет доступных мест", {textSize=12, color=T.muted, size=UDim2.new(1,0,0,20)})
+                    end
+                    
+                    for _, l in ipairs(State.remoteLobbies) do
+                        local c = card(l.placeName or "Unknown", l.name, 0, {placeId=l.placeId, confidential=l.hasPassword, hostName=l.hostName, lobbyId=l.id})
+                        c.Parent = aListAll
+                    end
+                end
+            end
+            task.wait(CATALOG_POLL)
+        end
+    end)
+end
+
+--==================================================================
+-- Init
+--==================================================================
+startWatching()
+if Selection then Selection.SelectionChanged:Connect(function() pcall(onSelectionChanged) end) end
+
+RunService.RenderStepped:Connect(function()
+    if State.connected and workspace.CurrentCamera then
+        local now = tick()
+        if now - State.lastCamSend > 0.15 then
+            local cam = workspace.CurrentCamera
+            if (cam.CFrame.Position - State.lastCamPos.Position).Magnitude > 0.1 or now - State.lastCamSend > 1 then
+                State.lastCamSend = now; State.lastCamPos = cam.CFrame
+                sendDelta("camera", {cframe = {cam.CFrame:GetComponents()}})
+            end
+        end
+    end
+end)
+
+switchTo("lobby")
+startCatalogPoll()
+logMsg("plugin", "success", "Plugin v5.4 loaded (roles→server1, synced markers, crown/mesh fixes)")
