@@ -1,6 +1,6 @@
 --!strict
 --==================================================================
--- CollabSync Plugin v5.5 — Full Code (Radmin, Meshes, Anti-Dupe)
+-- CollabSync Plugin v5.6 — Full Fix (Textures, Nil-Safety, Ping)
 --==================================================================
 local HttpService   = game:GetService("HttpService")
 local ChangeHistory = game:GetService("ChangeHistoryService")
@@ -67,7 +67,7 @@ local State = {
     lastAck=tick(), selectionMap={}, logs={}, applyingSnapshot=false,
     joinSnapshot=nil, lastPosCheck={}, blacklist={}, kickInProgress={},
     animGradients={}, pendingChunks={}, isReconnect=false,
-    markerLocalOffsets={}, markerRotations={}, synced=false,
+    markerLocalOffsets={}, markerRotations={}, synced=false, snapshotSent=false,
 }
 
 local function logMsg(scope, level, text)
@@ -731,7 +731,7 @@ refreshMarkerStyle = function(uid)
 end
 
 createLocalMarker = function(uid, name)
-    if uid == MY_ID then return end
+    if not uid or uid == MY_ID then return end -- ЗАЩИТА ОТ NIL
     if State.localMarkers[uid] then return end
     if markerLocks[uid] then return end
     markerLocks[uid] = true
@@ -896,7 +896,7 @@ local function sanitizeProps(props)
     if props.MeshId then props.MeshId = normalizeMeshId(props.MeshId) end
 end
 
--- === ФИКС МЕШЕЙ (AssetService) ===
+-- === ФИКС МЕШЕЙ И ТЕКСТУР ===
 local function applyMeshRobust(inst, props)
     if not inst:IsA("MeshPart") or not props.MeshId then return end
     local source = Content.fromUri(props.MeshId)
@@ -909,8 +909,22 @@ local function applyMeshRobust(inst, props)
             return AssetService:CreateMeshPartAsync(source, options)
         end)
         if success and freshMesh and inst.Parent then
+            if props.TextureID then
+                pcall(function() freshMesh.TextureID = normalizeMeshId(props.TextureID) or props.TextureID end)
+            end
             pcall(function() inst:ApplyMesh(freshMesh) end)
             freshMesh:Destroy()
+            
+            if props.TextureID then
+                task.spawn(function()
+                    for _ = 1, 10 do
+                        task.wait(0.1)
+                        if inst.Parent then
+                            pcall(function() inst.TextureID = normalizeMeshId(props.TextureID) or props.TextureID end)
+                        end
+                    end
+                end)
+            end
         end
     end)
 end
@@ -1163,10 +1177,11 @@ applyDelta = function(delta)
     if State.applyingRemote[delta.id] then return end
     State.applyingRemote[delta.id] = true
     local ok, err = pcall(function()
+        if not delta.userId then delta.userId = 0 end -- Защита от nil
+        
         if delta.kind == "camera" then
             if delta.userId ~= MY_ID and delta.cframe then
                 if not State.synced then return end
-                -- Защита от фантомных маркеров
                 local isValidPlayer = false
                 for _, p in ipairs(State.remotePlayers) do
                     if p.userId == delta.userId then isValidPlayer = true; break end
@@ -1418,7 +1433,7 @@ local previousScreen = nil
 local Header = I("Frame", {Size=UDim2.new(1,0,0,62), BackgroundColor3=T.surface, BorderSizePixel=0}, Main)
 round(Header, 14)
 lbl(Header, "CollabSync", {font=Enum.Font.GothamBold, textSize=20, size=UDim2.fromOffset(300,26), pos=UDim2.fromOffset(20,14), zIndex=2})
-lbl(Header, "v5.5 (PlaceTogether fixes)", {textSize=12, color=T.muted, size=UDim2.fromOffset(300,16), pos=UDim2.fromOffset(20,38), zIndex=2})
+lbl(Header, "v5.6 (PlaceTogether fixes)", {textSize=12, color=T.muted, size=UDim2.fromOffset(300,16), pos=UDim2.fromOffset(20,38), zIndex=2})
 local meHead = avatar(Header, 28, MY_ID); meHead.Position = UDim2.new(1, -430, 0, 17); meHead.ZIndex = 4
 meNameLbl = lbl(Header, formatName(MY_ID), {textSize=12, color=nameColor(MY_ID), size=UDim2.fromOffset(160,28), pos=UDim2.new(1, -396, 0, 17), zIndex=4, truncate=true})
 applyNameStyle(meNameLbl, MY_ID)
@@ -1933,6 +1948,7 @@ refreshPlayerList = function()
     local seen = {}
     local cleanPlayers = {}
     for _, p in ipairs(State.remotePlayers) do
+        if not p.userId then p.userId = 0 end -- ФИКС NIL
         if not seen[p.userId] then
             seen[p.userId] = true
             table.insert(cleanPlayers, p)
@@ -2035,7 +2051,6 @@ connectWebSocket = function(hostUrl, token, isHost, onReady, onFail, isReconnect
     
     State.wsClient = client
     local readyCalled = false
-    local snapshotSent = false
     
     client.Opened:Connect(function()
         State.connecting = false
@@ -2046,6 +2061,8 @@ connectWebSocket = function(hostUrl, token, isHost, onReady, onFail, isReconnect
     client.MessageReceived:Connect(function(msg)
         local ok, data = pcall(function() return HttpService:JSONDecode(msg) end)
         if not ok or type(data) ~= "table" then return end
+        
+        if data.type == "ping" then return end -- Keep-alive
         
         if data.type == "welcome" then
             State.connected = true; State.lastAck = tick()
@@ -2062,8 +2079,9 @@ connectWebSocket = function(hostUrl, token, isHost, onReady, onFail, isReconnect
             
             for uid in pairs(State.localMarkers) do if uid ~= MY_ID then destroyLocalMarker(uid) end end
             
-            if isHost and not snapshotSent then
-                snapshotSent = true
+            -- ФИКС: Не отправляем снапшот, если сервер его уже имеет
+            if isHost and not State.snapshotSent and (data.snapshotSize == 0 or data.snapshotSize == nil) then
+                State.snapshotSent = true
                 task.spawn(function()
                     local snap = buildSnapshot()
                     logMsg("lobby", "info", "Снапшот: "..#snap)
@@ -2148,6 +2166,7 @@ connectWebSocket = function(hostUrl, token, isHost, onReady, onFail, isReconnect
             local seen = {}
             local clean = {}
             for _, p in ipairs(State.remotePlayers) do
+                if not p.userId then p.userId = 0 end -- ФИКС NIL
                 if not seen[p.userId] then
                     seen[p.userId] = true
                     table.insert(clean, p)
@@ -2255,7 +2274,7 @@ stopSession = function()
         local old = State.wsClient; State.wsClient = nil
         pcall(function() old:Send(HttpService:JSONEncode({type="leave", userId=MY_ID})); old:Close() end)
     end
-    State.connected = false; State.connecting = false; State.synced = false
+    State.connected = false; State.connecting = false; State.synced = false; State.snapshotSent = false
     for uid in pairs(State.localMarkers) do destroyLocalMarker(uid) end
 end
 
@@ -2522,4 +2541,4 @@ end)
 
 switchTo("lobby")
 startCatalogPoll()
-logMsg("plugin", "success", "Plugin v5.5 loaded (PlaceTogether mesh fixes, dedupe, Radmin UI)")
+logMsg("plugin", "success", "Plugin v5.6 loaded (PlaceTogether mesh fixes, dedupe, Radmin UI)")
