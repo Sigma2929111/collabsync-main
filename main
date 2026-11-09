@@ -1,6 +1,6 @@
 --!strict
 --==================================================================
--- CollabSync Plugin v5.5 — Radmin UI, AssetService Meshes, Anti-Dupe
+-- CollabSync Plugin v5.5 — Full Code (Radmin, Meshes, Anti-Dupe)
 --==================================================================
 local HttpService   = game:GetService("HttpService")
 local ChangeHistory = game:GetService("ChangeHistoryService")
@@ -11,7 +11,7 @@ local UIS           = game:GetService("UserInputService")
 local RunService    = game:GetService("RunService")
 local InsertService = game:GetService("InsertService")
 local ServerStorage = game:GetService("ServerStorage")
-local AssetService  = game:GetService("AssetService") -- Для починки мешей
+local AssetService  = game:GetService("AssetService")
 
 local Selection = nil
 pcall(function() Selection = game:GetService("Selection") end)
@@ -22,7 +22,7 @@ local CATALOG_URL = "http://147.135.213.131:20231"
 local DEFAULT_HOST_URL = "http://147.135.213.131:20231"
 local HEARTBEAT_INTERVAL = 10
 local CATALOG_POLL = 15
-local WS_TIMEOUT = 15 -- Уменьшили до 15 сек, чтобы не висело вечно
+local WS_TIMEOUT = 15
 local RECONNECT_DELAY = 5
 local APPLY_CHUNK = 200
 local APPLY_CHUNK_DELAY = 0.03
@@ -110,6 +110,21 @@ fetchRoles(MY_ID, MY_NAME, function(r)
         if _G.__collabsync_refresh_styles then pcall(_G.__collabsync_refresh_styles) end
     end
 end)
+
+if PLUGIN and MY_ROLES.isOwner then
+    pcall(function()
+        local json = PLUGIN:GetSetting("cs_blacklist")
+        if json and json ~= "" then
+            local ok, decoded = pcall(function() return HttpService:JSONDecode(json) end)
+            if ok and type(decoded) == "table" then State.blacklist = decoded end
+        end
+    end)
+end
+local function saveBlacklist()
+    if PLUGIN and MY_ROLES.isOwner then
+        pcall(function() PLUGIN:SetSetting("cs_blacklist", HttpService:JSONEncode(State.blacklist)) end)
+    end
+end
 
 --==================================================================
 -- UI Helpers
@@ -293,7 +308,14 @@ isTester = function(uid) local r = getRoles(uid); return r and r.isTester or fal
 isBomb = function(uid) local r = getRoles(uid); return r and r.isBomb or false end
 isOwner = function(uid) local r = getRoles(uid); return r and r.isOwner or false end
 isTrash = function(uid) local r = getRoles(uid); return r and r.isTrash or false end
-isLobbyHost = function(uid) return currentLobby and currentLobby.hostId == uid end
+isLobbyHost = function(uid)
+    if not uid then return false end
+    if currentLobby and currentLobby.hostId and currentLobby.hostId == uid then return true end
+    for _, p in ipairs(State.remotePlayers or {}) do
+        if p.userId == uid and p.isHost then return true end
+    end
+    return false
+end
 
 nameColor = function(uid)
     if not uid then return T.text end
@@ -412,7 +434,10 @@ local OwnerTeammateTemplate = nil
 
 local function ensureCollabsyncModel()
     local existing = ServerStorage:FindFirstChild("Collabsync model")
-    if existing then CollabsyncModel = existing; return true end
+    if existing then
+        CollabsyncModel = existing
+        return true
+    end
     local ok, loaded = pcall(function() return InsertService:LoadAsset(COLLABSYNC_ASSET_ID) end)
     if not ok or not loaded then
         logMsg("plugin", "warn", "Не удалось загрузить Collabsync model")
@@ -702,6 +727,7 @@ refreshMarkerStyle = function(uid)
             computeMarkerOffsets(uid)
         end
     end)
+    logMsg("lobby", "info", "Корона добавлена для "..sphereName(uid))
 end
 
 createLocalMarker = function(uid, name)
@@ -820,7 +846,7 @@ processPendingMarkers = function()
 end
 
 --==================================================================
--- Serialization & AssetService Mesh Loading (Из PlaceTogether)
+-- Serialization & AssetService Mesh Loading
 --==================================================================
 local SYNC_SERVICES = {
     game:GetService("Workspace"), game:GetService("ServerScriptService"),
@@ -870,7 +896,7 @@ local function sanitizeProps(props)
     if props.MeshId then props.MeshId = normalizeMeshId(props.MeshId) end
 end
 
--- === ФИКС МЕШЕЙ ОТ PLACETOGETHER ===
+-- === ФИКС МЕШЕЙ (AssetService) ===
 local function applyMeshRobust(inst, props)
     if not inst:IsA("MeshPart") or not props.MeshId then return end
     local source = Content.fromUri(props.MeshId)
@@ -883,7 +909,7 @@ local function applyMeshRobust(inst, props)
             return AssetService:CreateMeshPartAsync(source, options)
         end)
         if success and freshMesh and inst.Parent then
-            inst:ApplyMesh(freshMesh)
+            pcall(function() inst:ApplyMesh(freshMesh) end)
             freshMesh:Destroy()
         end
     end)
@@ -1140,7 +1166,7 @@ applyDelta = function(delta)
         if delta.kind == "camera" then
             if delta.userId ~= MY_ID and delta.cframe then
                 if not State.synced then return end
-                -- ФИКС: Проверяем, что игрок реально в лобби, чтобы не создавать маркеры-призраки
+                -- Защита от фантомных маркеров
                 local isValidPlayer = false
                 for _, p in ipairs(State.remotePlayers) do
                     if p.userId == delta.userId then isValidPlayer = true; break end
@@ -1216,10 +1242,11 @@ applyDelta = function(delta)
                 end
                 State.objectMap[delta.id] = newInst
                 watchInstance(newInst)
-                -- ФИКС МЕШЕЙ
+                
                 if delta.className == "MeshPart" and delta.props then
                     applyMeshRobust(newInst, delta.props)
                 end
+                
                 if (delta.className == "Motor6D" or delta.className == "Weld" or delta.className == "Snap") and delta.props then
                     task.spawn(function()
                         for _ = 1, 15 do
@@ -1242,7 +1269,6 @@ applyDelta = function(delta)
                 State.applyingRemote[inst] = true
                 applyProps(inst, delta.props, delta.attrs)
                 if delta.name and inst.Name ~= delta.name then pcall(function() inst.Name = delta.name end) end
-                -- ФИКС МЕШЕЙ
                 if inst:IsA("MeshPart") and delta.props then
                     applyMeshRobust(inst, delta.props)
                 end
@@ -1325,7 +1351,7 @@ onSelectionChanged = function()
 end
 
 --==================================================================
--- Root & UI / Loading
+-- Root & Loading
 --==================================================================
 root = I("ScreenGui", {Name="CollabSync", ResetOnSpawn=false, IgnoreGuiInset=true, ZIndexBehavior=Enum.ZIndexBehavior.Sibling, DisplayOrder=100}, CoreGui)
 if PLUGIN then
@@ -1491,11 +1517,371 @@ tabCreate.MouseButton1Click:Connect(function() switchTo("create") end)
 tabDirect.MouseButton1Click:Connect(function() switchTo("direct") end)
 
 --==================================================================
--- LogsWindow & SETTINGS (без изменений)
+-- LogsWindow
 --==================================================================
--- ... (остальной код логики и настроек идентичен предыдущей версии)
--- Вставь сюда код LogsWindow и Settings из предыдущего полного кода
--- ...
+LogsWindow = I("Frame", {Name="LogsFrame", Size=UDim2.fromOffset(700,500), Position=UDim2.new(0.5,-350,0.5,-250), BackgroundColor3=T.bg, BorderSizePixel=0, Visible=false, ZIndex=150}, root)
+round(LogsWindow, 14); outline(LogsWindow, T.border, 1)
+local LHeader = I("Frame", {Size=UDim2.new(1,0,0,50), BackgroundColor3=T.surface, BorderSizePixel=0}, LogsWindow)
+round(LHeader, 14)
+lbl(LHeader, "Логи", {font=Enum.Font.GothamBold, textSize=16, size=UDim2.fromOffset(300,26), pos=UDim2.fromOffset(20,12), zIndex=2})
+local lDrag = I("TextButton", {Size=UDim2.new(1,-300,1,0), BackgroundTransparency=1, BorderSizePixel=0, Text="", AutoButtonColor=false, ZIndex=3}, LHeader)
+makeDraggable(LogsWindow, lDrag)
+local lClearBtn = btn(LHeader, "Очистить", {size=UDim2.fromOffset(90,30), pos=UDim2.new(1,-250,0,10), bg=T.surf2, hoverBg=T.warn, textSize=11, zIndex=4})
+local lCopyBtn = btn(LHeader, "Копир.", {size=UDim2.fromOffset(80,30), pos=UDim2.new(1,-155,0,10), bg=T.accent, hoverBg=T.accent2, textSize=11, zIndex=4})
+local lCloseBtn = btn(LHeader, "×", {size=UDim2.fromOffset(36,36), pos=UDim2.new(1,-56,0,7), bg=T.surf2, hoverBg=T.danger, textSize=20, zIndex=4})
+lCloseBtn.MouseButton1Click:Connect(function() LogsWindow.Visible = false end)
+
+local LFilter = lbl(LogsWindow, "", {textSize=11, color=T.muted, size=UDim2.new(1,-40,0,16), pos=UDim2.fromOffset(20,58)})
+local LScroll = I("ScrollingFrame", {Size=UDim2.new(1,-40,1,-100), Position=UDim2.fromOffset(20,80), BackgroundColor3=T.surface, BorderSizePixel=0, CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y, ScrollBarThickness=6, ScrollBarImageColor3=T.border}, LogsWindow)
+round(LScroll, 8); outline(LScroll, T.border, 1); pad(LScroll, 8)
+local LList = I("Frame", {Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1}, LScroll)
+I("UIListLayout", {Padding=UDim.new(0,2)}, LList)
+
+local function refreshLogsUI()
+    if not LogsWindow or not LogsWindow.Visible then return end
+    for _, ch in ipairs(LList:GetChildren()) do if ch:IsA("TextLabel") then ch:Destroy() end end
+    local inLobby = State.session ~= nil
+    LFilter.Text = inLobby and "Режим: Лобби" or "Режим: Плагин"
+    local count = 0
+    for _, entry in ipairs(State.logs) do
+        if inLobby or entry.scope == "plugin" then
+            count = count + 1
+            local color = T.text
+            local prefix = ""
+            if entry.level == "error" then color = T.danger; prefix = "[ERR] "
+            elseif entry.level == "warn" then color = T.warn; prefix = "[WRN] "
+            elseif entry.level == "action" then color = T.accent; prefix = "[ACT] "
+            elseif entry.level == "success" then color = T.success; prefix = "[OK] " end
+            I("TextLabel", {Size=UDim2.new(1,0,0,18), BackgroundTransparency=1, Font=Enum.Font.Code, TextSize=11, TextColor3=color, TextXAlignment=Enum.TextXAlignment.Left, Text=entry.time.."  "..prefix..entry.text}, LList)
+        end
+    end
+    if count == 0 then lbl(LList, "Пусто.", {textSize=12, color=T.muted, size=UDim2.new(1,0,0,20)}) end
+    task.defer(function() task.wait(0.05); if LScroll then LScroll.CanvasPosition = Vector2.new(0, math.max(0, LScroll.AbsoluteCanvasSize.Y - LScroll.AbsoluteWindowSize.Y)) end end)
+end
+_G.__collabsync_update_logs = refreshLogsUI
+
+local function toggleLogs()
+    if not LogsWindow then return end
+    LogsWindow.Visible = not LogsWindow.Visible
+    if LogsWindow.Visible then refreshLogsUI() end
+end
+logsBtn.MouseButton1Click:Connect(toggleLogs)
+lClearBtn.MouseButton1Click:Connect(function() State.logs = {}; refreshLogsUI() end)
+lCopyBtn.MouseButton1Click:Connect(function()
+    local inLobby = State.session ~= nil
+    local text = "=== CollabSync ===\n"
+    for _, entry in ipairs(State.logs) do
+        if inLobby or entry.scope == "plugin" then text = text..entry.time.." ["..entry.level.."] "..entry.text.."\n" end
+    end
+    local ok = pcall(function() setclipboard(text) end)
+    showToast(LogsWindow, ok and "Скопировано" or "Ошибка", ok and T.success or T.danger)
+end)
+
+_G.__collabsync_refresh_styles = function()
+    if meNameLbl and meNameLbl.Parent then
+        pcall(function()
+            meNameLbl.Text = formatName(MY_ID)
+            meNameLbl.TextColor3 = nameColor(MY_ID)
+        end)
+    end
+    for uid in pairs(State.localMarkers) do
+        if refreshMarkerStyle then pcall(refreshMarkerStyle, uid) end
+    end
+    if refreshPlayerList then pcall(refreshPlayerList) end
+end
+
+--==================================================================
+-- SETTINGS
+--==================================================================
+S = I("Frame", {Name="SettingsFrame", Size=UDim2.fromOffset(860,600), Position=UDim2.new(0.5,-430,0.5,-300), BackgroundColor3=T.bg, BorderSizePixel=0, Visible=false}, root)
+round(S, 14); outline(S, T.border, 1)
+local closeSettings
+closeSettings = function()
+    S.Visible = false; local target = previousScreen or Main
+    if not target or not target.Parent then target = Main end
+    target.Visible = true; lastVisibleFrame = target; previousScreen = nil
+end
+
+local SHeader = I("Frame", {Size=UDim2.new(1,0,0,62), BackgroundColor3=T.surface, BorderSizePixel=0}, S)
+round(SHeader, 14)
+lbl(SHeader, "Настройки", {font=Enum.Font.GothamBold, textSize=16, size=UDim2.fromOffset(300,26), pos=UDim2.fromOffset(20,18), zIndex=2})
+local sBack = btn(SHeader, "← Назад", {size=UDim2.fromOffset(100,34), pos=UDim2.new(1,-250,0,14), bg=T.surf2, hoverBg=T.border, textSize=13, zIndex=4})
+sBack.MouseButton1Click:Connect(function() closeSettings() end)
+local sDrag = I("TextButton", {Size=UDim2.new(1,-350,1,0), BackgroundTransparency=1, BorderSizePixel=0, Text="", AutoButtonColor=false, ZIndex=3}, SHeader)
+makeDraggable(S, sDrag)
+local sClose = btn(SHeader, "×", {size=UDim2.fromOffset(36,36), pos=UDim2.new(1,-56,0,13), bg=T.surf2, hoverBg=T.danger, textSize=20, zIndex=4})
+sClose.MouseButton1Click:Connect(function() closeSettings() end)
+
+local STabs = I("Frame", {Size=UDim2.new(1,-40,0,44), Position=UDim2.fromOffset(20,78), BackgroundColor3=T.surface, BorderSizePixel=0}, S)
+round(STabs, 10)
+local sTabGui = btn(STabs, "Интерфейс", {size=UDim2.fromOffset(140,34), pos=UDim2.fromOffset(5,5), bg=T.accent, hoverBg=T.accent2, textSize=13})
+local sTabPlace = btn(STabs, "Доступ", {size=UDim2.fromOffset(150,34), pos=UDim2.fromOffset(150,5), bg=T.surface, hoverBg=T.surf2, textSize=13})
+local sTabPerms = btn(STabs, "Права", {size=UDim2.fromOffset(150,34), pos=UDim2.fromOffset(305,5), bg=T.surface, hoverBg=T.surf2, textSize=13})
+local sTabBlack = btn(STabs, "Blacklist ⭐", {size=UDim2.fromOffset(150,34), pos=UDim2.fromOffset(460,5), bg=T.surface, hoverBg=T.surf2, textSize=13})
+
+local SContent = I("Frame", {Size=UDim2.new(1,-40,1,-140), Position=UDim2.fromOffset(20,130), BackgroundTransparency=1}, S)
+local SGui = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1}, SContent)
+local SPlace = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Visible=false}, SContent)
+local SPerms = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Visible=false}, SContent)
+local SBlack = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Visible=false}, SContent)
+
+local function toggleRow(parent, label, yPos, initialOn, callback)
+    local r = I("Frame", {Size=UDim2.new(1,0,0,44), Position=UDim2.fromOffset(0,yPos), BackgroundColor3=T.surface, BorderSizePixel=0}, parent)
+    round(r, 8); outline(r, T.border, 1)
+    lbl(r, label, {textSize=13, size=UDim2.new(1,-80,1,0), pos=UDim2.fromOffset(14,0)})
+    local on = initialOn or false
+    local tbg = I("Frame", {Size=UDim2.fromOffset(44,24), Position=UDim2.new(1,-60,0.5,-12), BackgroundColor3=on and T.accent or T.surf3, BorderSizePixel=0}, r)
+    round(tbg, 12)
+    local dot = I("Frame", {Size=UDim2.fromOffset(18,18), Position=on and UDim2.fromOffset(23,3) or UDim2.fromOffset(3,3), BackgroundColor3=T.text, BorderSizePixel=0}, tbg)
+    round(dot, 9)
+    I("TextButton", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text="", ZIndex=5}, tbg).MouseButton1Click:Connect(function()
+        on = not on; tbg.BackgroundColor3 = on and T.accent or T.surf3
+        dot.Position = on and UDim2.fromOffset(23,3) or UDim2.fromOffset(3,3)
+        if callback then callback(on) end
+    end)
+end
+
+lbl(SGui, "Настройки интерфейса", {font=Enum.Font.GothamBold, textSize=16, size=UDim2.new(1,0,0,24)})
+toggleRow(SGui, "Тёмная тема", 40, settings.isDark, function(isDark) settings.isDark = isDark; applyTheme(isDark) end)
+toggleRow(SGui, "Аватары", 92, settings.showAvatars, function(on) settings.showAvatars = on end)
+toggleRow(SGui, "Уведомления", 144, settings.showNotifications, function(on) settings.showNotifications = on end)
+toggleRow(SGui, "Автопереподключение", 196, settings.autoReconnect, function(on) settings.autoReconnect = on end)
+
+-- Place access
+lbl(SPlace, "Кто имеет доступ к этому месту", {font=Enum.Font.GothamBold, textSize=16, size=UDim2.new(1,0,0,24)})
+lbl(SPlace, "Пользователи из списка смогут присоединяться без пароля.", {textSize=12, color=T.muted, size=UDim2.new(1,0,0,18), pos=UDim2.fromOffset(0,26)})
+local whitelist = I("Frame", {Size=UDim2.new(1,0,1,-190), Position=UDim2.fromOffset(0,54), BackgroundColor3=T.surface, BorderSizePixel=0}, SPlace)
+round(whitelist, 10); outline(whitelist, T.border, 1); pad(whitelist, 10)
+local wlList = I("Frame", {Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1}, whitelist)
+I("UIListLayout", {Padding=UDim.new(0,8)}, wlList)
+
+local function userRow(uid, name, isHostRow)
+    local r = I("Frame", {Size=UDim2.new(1,0,0,40), BackgroundColor3=T.surf2, BorderSizePixel=0}, wlList)
+    round(r, 8); r:SetAttribute("uid", uid)
+    avatar(r, 28, uid).Position = UDim2.fromOffset(6,6)
+    local nLbl = lbl(r, formatName(uid), {textSize=13, size=UDim2.new(1,-180,1,0), pos=UDim2.fromOffset(44,0)})
+    applyNameStyle(nLbl, uid)
+    if isHostRow then
+        lbl(r, "👑", {font=Enum.Font.GothamBold, textSize=16, color=T.gold, xAlign=Enum.TextXAlignment.Center, size=UDim2.fromOffset(30,26), pos=UDim2.new(1,-100,0.5,-13)})
+        return
+    end
+    local delBtn = btn(r, "Удалить", {size=UDim2.fromOffset(90,26), pos=UDim2.new(1,-100,0.5,-13), bg=T.surface, hoverBg=T.danger, textSize=11})
+    delBtn.MouseButton1Click:Connect(function()
+        local scope = currentWhitelistScope
+        if not scope or not scope.whitelist then return end
+        for i, u in ipairs(scope.whitelist) do if u == uid then table.remove(scope.whitelist, i); break end end
+        r:Destroy()
+    end)
+end
+
+refreshWhitelist = function()
+    for _, ch in ipairs(wlList:GetChildren()) do if ch:IsA("Frame") then ch:Destroy() end end
+    local scope = currentWhitelistScope
+    if not scope or not scope.whitelist then return end
+    local hostUid = scope.hostId or MY_ID
+    for _, uid in ipairs(scope.whitelist) do userRow(uid, formatName(uid), uid == hostUid) end
+end
+
+-- Autocomplete dropdown
+local searchPreview = I("Frame", {Size=UDim2.new(1,0,0,0), Position=UDim2.new(0,0,1,-56), BackgroundColor3=T.surf2, BorderSizePixel=0, Visible=false, ZIndex=10}, SPlace)
+round(searchPreview, 8); outline(searchPreview, T.accent, 1)
+local spLayout = I("UIListLayout", {Padding=UDim.new(0,0)}, searchPreview)
+
+local addRow = I("Frame", {Size=UDim2.new(1,0,0,44), Position=UDim2.new(0,0,1,-50), BackgroundColor3=T.surface, BorderSizePixel=0}, SPlace)
+round(addRow, 8); outline(addRow, T.border, 1); pad(addRow, 6, 10)
+local addBox = I("TextBox", {Size=UDim2.new(1,-140,1,0), BackgroundTransparency=1, BorderSizePixel=0, Font=Enum.Font.Gotham, TextSize=13, TextColor3=T.text, PlaceholderText="ID или ник", PlaceholderColor3=T.muted, Text="", TextXAlignment=Enum.TextXAlignment.Left}, addRow)
+local addBtn = btn(addRow, "Добавить", {size=UDim2.fromOffset(120,32), pos=UDim2.new(1,-120,0.5,-16), bg=T.accent, hoverBg=T.accent2, textSize=12})
+
+local currentSuggestUid = nil
+local currentSuggestName = nil
+local searchDebounce = tick()
+
+addBox:GetPropertyChangedSignal("Text"):Connect(function()
+    searchDebounce = tick()
+    local txt = addBox.Text
+    local myStamp = searchDebounce
+    currentSuggestUid = nil
+    currentSuggestName = nil
+    
+    if txt == "" then searchPreview.Visible = false; return end
+    
+    task.delay(0.4, function()
+        if myStamp ~= searchDebounce then return end
+        local uid = tonumber(txt)
+        local info = nil
+        
+        if uid then
+            info = {uid=uid, name=resolveName(uid)}
+        else
+            local ok, result = pcall(function() return Players:GetUserIdFromNameAsync(txt) end)
+            if ok and result then info = {uid=result, name=txt} end
+        end
+        
+        for _, ch in ipairs(searchPreview:GetChildren()) do if ch:IsA("Frame") then ch:Destroy() end end
+        searchPreview.Visible = true
+        
+        if info then
+            currentSuggestUid = info.uid
+            currentSuggestName = info.name
+            local row = I("Frame", {Size=UDim2.new(1,0,0,40), BackgroundTransparency=1}, searchPreview)
+            avatar(row, 28, info.uid).Position = UDim2.fromOffset(6,6)
+            local n = lbl(row, info.name.."  (ID: "..info.uid..")", {textSize=13, size=UDim2.new(1,-60,1,0), pos=UDim2.fromOffset(44,0)})
+            applyNameStyle(n, info.uid)
+            local cb = I("TextButton", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text="", ZIndex=11}, row)
+            cb.MouseButton1Click:Connect(function()
+                addBox.Text = tostring(info.uid)
+            end)
+        else
+            local row = I("Frame", {Size=UDim2.new(1,0,0,40), BackgroundTransparency=1}, searchPreview)
+            lbl(row, "Не найден: "..txt, {textSize=13, color=T.danger, size=UDim2.new(1,-10,1,0), pos=UDim2.fromOffset(10,0)})
+        end
+        searchPreview.Size = UDim2.new(1, 0, 0, 40)
+    end)
+end)
+
+addBtn.MouseButton1Click:Connect(function()
+    local scope = currentWhitelistScope
+    if not scope or not scope.whitelist then return end
+    local txt = addBox.Text
+    if txt == "" then return end
+    
+    local uid = currentSuggestUid
+    local name = currentSuggestName
+    if not uid then
+        local n = tonumber(txt)
+        if n then uid = n; name = resolveName(n) else
+            local ok, r = pcall(function() return Players:GetUserIdFromNameAsync(txt) end)
+            if ok and r then uid = r; name = txt end
+        end
+    end
+    
+    if not uid then showToast(S, "Пользователь не найден", T.danger); return end
+    for _, u in ipairs(scope.whitelist) do if u == uid then showToast(S, "Уже в списке", T.warn); return end end
+    
+    table.insert(scope.whitelist, uid)
+    refreshWhitelist()
+    addBox.Text = ""
+    searchPreview.Visible = false
+    currentSuggestUid = nil
+    currentSuggestName = nil
+end)
+
+-- Perms
+lbl(SPerms, "Права участников", {font=Enum.Font.GothamBold, textSize=16, size=UDim2.new(1,0,0,24)})
+local permsBody = I("Frame", {Size=UDim2.new(1,0,1,-130), Position=UDim2.fromOffset(0,54), BackgroundColor3=T.surface, BorderSizePixel=0}, SPerms)
+round(permsBody, 10); outline(permsBody, T.border, 1); pad(permsBody, 10)
+local permList = I("Frame", {Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1}, permsBody)
+I("UIListLayout", {Padding=UDim.new(0,8)}, permList)
+
+local permNames = {"Редакт.", "Удалять", "Двигать", "Добавлять"}
+local permRow = function(uid, name, defaults, isHostRow)
+    local r = I("Frame", {Size=UDim2.new(1,0,0,52), BackgroundColor3=T.surf2, BorderSizePixel=0}, permList)
+    round(r, 8)
+    avatar(r, 28, uid).Position = UDim2.fromOffset(6,12)
+    local nLbl = lbl(r, formatName(uid), {textSize=13, size=UDim2.new(1,-360,1,0), pos=UDim2.fromOffset(44,0), truncate=true})
+    applyNameStyle(nLbl, uid)
+    
+    if isHostRow then
+        lbl(r, "👑", {font=Enum.Font.GothamBold, textSize=16, color=T.gold, xAlign=Enum.TextXAlignment.Left, size=UDim2.fromOffset(28,26), pos=UDim2.new(1,-360,0.5,-13)})
+    elseif isOwnLobby and uid ~= MY_ID then
+        local kickBtn = btn(r, "Кикнуть", {size=UDim2.fromOffset(78,24), pos=UDim2.new(1,-360,0.5,-12), bg=T.surface, hoverBg=T.danger, textSize=11})
+        kickBtn.MouseButton1Click:Connect(function() kickPlayer(uid) end)
+    end
+    
+    local cbox = I("Frame", {Size=UDim2.new(0,270,1,0), Position=UDim2.new(1,-270,0,0), BackgroundTransparency=1}, r)
+    I("UIListLayout", {FillDirection=Enum.FillDirection.Horizontal, Padding=UDim.new(0,6), VerticalAlignment=Enum.VerticalAlignment.Center, HorizontalAlignment=Enum.HorizontalAlignment.Right}, cbox)
+    
+    for i, pname in ipairs(permNames) do
+        local on = (defaults and defaults[i]) or false
+        local chip = I("Frame", {Size=UDim2.fromOffset(62,26), BackgroundColor3=on and T.success or T.surf3, BorderSizePixel=0}, cbox)
+        round(chip, 6)
+        lbl(chip, pname, {textSize=10, xAlign=Enum.TextXAlignment.Center, color=on and Color3.new(1,1,1) or T.muted, size=UDim2.fromScale(1,1)})
+        local cb = I("TextButton", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text="", ZIndex=5}, chip)
+        local isOn = on
+        cb.MouseButton1Click:Connect(function()
+            isOn = not isOn
+            chip.BackgroundColor3 = isOn and T.success or T.surf3
+            chip:FindFirstChildOfClass("TextLabel").TextColor3 = isOn and Color3.new(1,1,1) or T.muted
+        end)
+    end
+end
+
+refreshPerms = function()
+    for _, ch in ipairs(permList:GetChildren()) do if ch:IsA("Frame") then ch:Destroy() end end
+    if not State.session then return end
+    local players = State.remotePlayers
+    if #players == 0 then players = {{userId=MY_ID, userName=MY_NAME, isHost=isOwnLobby, roles=MY_ROLES}} end
+    for _, p in ipairs(players) do
+        local isHostRow = p.isHost or isLobbyHost(p.userId)
+        permRow(p.userId, formatName(p.userId), {true, true, true, true}, isHostRow)
+    end
+end
+
+-- Blacklist
+local blacklistBody = I("Frame", {Size=UDim2.new(1,0,1,-130), Position=UDim2.fromOffset(0,54), BackgroundColor3=T.surface, BorderSizePixel=0}, SBlack)
+round(blacklistBody, 10); outline(blacklistBody, T.border, 1); pad(blacklistBody, 10)
+local blList = I("Frame", {Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1}, blacklistBody)
+I("UIListLayout", {Padding=UDim.new(0,6)}, blList)
+
+local blInputRow = I("Frame", {Size=UDim2.new(1,0,0,44), Position=UDim2.new(0,0,1,-50), BackgroundColor3=T.surface, BorderSizePixel=0}, SBlack)
+round(blInputRow, 8); outline(blInputRow, T.border, 1); pad(blInputRow, 6, 10)
+local blBox = I("TextBox", {Size=UDim2.new(1,-140,1,0), BackgroundTransparency=1, BorderSizePixel=0, Font=Enum.Font.Gotham, TextSize=13, TextColor3=T.text, PlaceholderText="ID или ник", PlaceholderColor3=T.muted, Text="", TextXAlignment=Enum.TextXAlignment.Left}, blInputRow)
+local blAddBtn = btn(blInputRow, "Забанить", {size=UDim2.fromOffset(120,32), pos=UDim2.new(1,-120,0.5,-16), bg=T.danger, hoverBg=Color3.fromRGB(255,120,120), textSize=12})
+
+local function rebuildBlacklistUI()
+    for _, ch in ipairs(blList:GetChildren()) do if ch:IsA("Frame") then ch:Destroy() end end
+    for key, val in pairs(State.blacklist) do
+        if val then
+            local r = I("Frame", {Size=UDim2.new(1,0,0,36), BackgroundColor3=T.surf2, BorderSizePixel=0}, blList)
+            round(r, 6)
+            lbl(r, key, {textSize=13, size=UDim2.new(1,-100,1,0), pos=UDim2.fromOffset(10,0)})
+            local delBtn = btn(r, "Удалить", {size=UDim2.fromOffset(80,26), pos=UDim2.new(1,-90,0.5,-13), bg=T.surface, hoverBg=T.danger, textSize=11})
+            delBtn.MouseButton1Click:Connect(function()
+                State.blacklist[key] = nil
+                saveBlacklist()
+                rebuildBlacklistUI()
+            end)
+        end
+    end
+end
+
+blAddBtn.MouseButton1Click:Connect(function()
+    local txt = blBox.Text
+    if txt == "" then return end
+    State.blacklist[txt] = true
+    saveBlacklist()
+    blBox.Text = ""
+    rebuildBlacklistUI()
+end)
+
+local function switchSTab(which)
+    SGui.Visible = (which == "gui"); SPlace.Visible = (which == "place"); SPerms.Visible = (which == "perms"); SBlack.Visible = (which == "black")
+    sTabGui.BackgroundColor3 = (which == "gui") and T.accent or T.surface
+    sTabPlace.BackgroundColor3 = (which == "place") and T.accent or T.surface
+    sTabPerms.BackgroundColor3 = (which == "perms") and T.accent or T.surface
+    sTabBlack.BackgroundColor3 = (which == "black") and T.accent or T.surface
+end
+
+sTabGui.MouseButton1Click:Connect(function() switchSTab("gui") end)
+sTabPlace.MouseButton1Click:Connect(function() refreshWhitelist(); switchSTab("place") end)
+sTabPerms.MouseButton1Click:Connect(function() refreshPerms(); switchSTab("perms") end)
+sTabBlack.MouseButton1Click:Connect(function() rebuildBlacklistUI(); switchSTab("black") end)
+
+local openSettings = function(context)
+    previousScreen = lastVisibleFrame
+    Main.Visible = false; InPlace.Visible = false; S.Visible = true
+    lastVisibleFrame = S
+    if context == "main" then currentWhitelistScope = State.myPlace
+    elseif context == "inplace" and isOwnLobby and currentLobby then currentWhitelistScope = currentLobby
+    else currentWhitelistScope = nil end
+    
+    local isOwnerRole = MY_ROLES and MY_ROLES.isOwner
+    sTabPlace.Visible = (currentWhitelistScope ~= nil)
+    sTabPerms.Visible = (context == "inplace" and isOwnLobby)
+    sTabBlack.Visible = isOwnerRole
+    switchSTab("gui")
+end
+settingsBtn.MouseButton1Click:Connect(function() openSettings("main") end)
 
 --==================================================================
 -- IN-PLACE (ЧАТ И ИГРОКИ)
@@ -1541,11 +1927,9 @@ kickPlayer = function(uid)
     pcall(function() State.wsClient:Send(HttpService:JSONEncode({type="kick", targetUserId=uid})) end)
 end
 
--- === ФИКС ДЕДУПЛИКАЦИИ ИГРОКОВ ===
 refreshPlayerList = function()
     for _, ch in ipairs(pList:GetChildren()) do if ch:IsA("Frame") then ch:Destroy() end end
     
-    -- Очищаем дубликаты перед отрисовкой
     local seen = {}
     local cleanPlayers = {}
     for _, p in ipairs(State.remotePlayers) do
@@ -1555,7 +1939,6 @@ refreshPlayerList = function()
         end
     end
     State.remotePlayers = cleanPlayers
-    -- ================================
 
     local players = State.remotePlayers
     if #players == 0 then players = {{userId=MY_ID, userName=MY_NAME, isHost=isOwnLobby, roles=MY_ROLES}} end
@@ -1573,7 +1956,7 @@ refreshPlayerList = function()
 end
 _G.__collabsync_refresh_players = refreshPlayerList
 
--- === ЧАТ ===
+-- ЧАТ
 local ChatPane = I("Frame", {Size=UDim2.new(1,-320,1,0), Position=UDim2.fromOffset(320,0), BackgroundColor3=T.surface, BorderSizePixel=0}, IPBody)
 round(ChatPane, 10); outline(ChatPane, T.border, 1)
 lbl(ChatPane, "Чат", {font=Enum.Font.GothamBold, textSize=14, size=UDim2.new(1,-24,0,22), pos=UDim2.fromOffset(12,12)})
@@ -1762,7 +2145,6 @@ connectWebSocket = function(hostUrl, token, isHost, onReady, onFail, isReconnect
             
         elseif data.type == "players" then
             State.remotePlayers = data.players or {}
-            -- ФИКС ДУБЛИКАТОВ
             local seen = {}
             local clean = {}
             for _, p in ipairs(State.remotePlayers) do
@@ -1839,7 +2221,6 @@ connectWebSocket = function(hostUrl, token, isHost, onReady, onFail, isReconnect
         if not readyCalled then readyCalled = true; pcall(onFail, "Ошибка: "..tostring(err)) end
     end)
     
-    -- ФИКС ТАЙМАУТА (не дает лобби зависнуть)
     task.delay(WS_TIMEOUT, function()
         if State.connecting then
             State.connecting = false
