@@ -897,8 +897,11 @@ local function sanitizeProps(props)
 end
 
 -- === ФИКС МЕШЕЙ И ТЕКСТУР ===
+local meshApplyVersion = setmetatable({}, {__mode = "k"})
 local function applyMeshRobust(inst, props)
     if not inst:IsA("MeshPart") or not props.MeshId then return end
+    meshApplyVersion[inst] = (meshApplyVersion[inst] or 0) + 1
+    local applyVersion = meshApplyVersion[inst]
     local source = Content.fromUri(props.MeshId)
     local options = {}
     if props.RenderFidelity and Enum.RenderFidelity[props.RenderFidelity] then options.RenderFidelity = Enum.RenderFidelity[props.RenderFidelity] end
@@ -908,20 +911,20 @@ local function applyMeshRobust(inst, props)
         local success, freshMesh = pcall(function()
             return AssetService:CreateMeshPartAsync(source, options)
         end)
-        if success and freshMesh and inst.Parent then
+        if success and freshMesh then
+            if meshApplyVersion[inst] ~= applyVersion or not inst.Parent then
+                freshMesh:Destroy()
+                return
+            end
             if props.TextureID then
                 pcall(function() freshMesh.TextureID = normalizeMeshId(props.TextureID) or props.TextureID end)
             end
             pcall(function() inst:ApplyMesh(freshMesh) end)
             freshMesh:Destroy()
-            
-            if props.TextureID then
-                task.spawn(function()
-                    for _ = 1, 10 do
-                        task.wait(0.1)
-                        if inst.Parent then
-                            pcall(function() inst.TextureID = normalizeMeshId(props.TextureID) or props.TextureID end)
-                        end
+            if props.TextureID and meshApplyVersion[inst] == applyVersion then
+                task.defer(function()
+                    if inst.Parent and meshApplyVersion[inst] == applyVersion then
+                        pcall(function() inst.TextureID = normalizeMeshId(props.TextureID) or props.TextureID end)
                     end
                 end)
             end
@@ -976,13 +979,26 @@ local function applyProps(inst, props, attrs)
         if props.Massless ~= nil then pcall(function() inst.Massless = props.Massless end) end
         if props.Locked ~= nil then pcall(function() inst.Locked = props.Locked end) end
         if props.Material then pcall(function() inst.Material = Enum.Material[props.Material] end) end
+        if props.MaterialVariant ~= nil then pcall(function() inst.MaterialVariant = props.MaterialVariant end) end
         if props.Shape and inst:IsA("Part") then pcall(function() inst.Shape = Enum.PartType[props.Shape] end) end
+    end
+    if inst:IsA("SurfaceAppearance") then
+        for _, key in ipairs({"ColorMap", "MetalnessMap", "NormalMap", "RoughnessMap"}) do
+            if props[key] ~= nil then pcall(function() inst[key] = props[key] end) end
+        end
+        if props.AlphaMode then pcall(function() inst.AlphaMode = Enum.AlphaMode[props.AlphaMode] end) end
     end
     if inst:IsA("Decal") or inst:IsA("Texture") then
         if props.Texture then pcall(function() inst.Texture = normalizeMeshId(props.Texture) or props.Texture end) end
         if props.Color3 and inst:IsA("Decal") then pcall(function() inst.Color3 = Color3.new(unpack(props.Color3)) end) end
         if props.Transparency ~= nil then pcall(function() inst.Transparency = props.Transparency end) end
         if props.Face and inst:IsA("FaceInstance") then pcall(function() inst.Face = Enum.NormalId[props.Face] end) end
+        if inst:IsA("Texture") then
+            if props.StudsPerTileU ~= nil then pcall(function() inst.StudsPerTileU = props.StudsPerTileU end) end
+            if props.StudsPerTileV ~= nil then pcall(function() inst.StudsPerTileV = props.StudsPerTileV end) end
+            if props.OffsetStudsU ~= nil then pcall(function() inst.OffsetStudsU = props.OffsetStudsU end) end
+            if props.OffsetStudsV ~= nil then pcall(function() inst.OffsetStudsV = props.OffsetStudsV end) end
+        end
     end
     if inst:IsA("Shirt") or inst:IsA("Pants") or inst:IsA("ShirtGraphic") then
         if props.Template then pcall(function() inst.Template = props.Template end) end
@@ -1037,6 +1053,7 @@ local function serializeInstance(inst)
             props.Massless = inst.Massless
             props.Locked = inst.Locked
             props.Material = inst.Material.Name
+            pcall(function() props.MaterialVariant = inst.MaterialVariant end)
             if inst:IsA("Part") then props.Shape = inst.Shape.Name end
             if inst:IsA("MeshPart") then
                 local mid = ""; pcall(function() mid = inst.MeshId end)
@@ -1061,6 +1078,14 @@ local function serializeInstance(inst)
             props.JumpPower = inst.JumpPower
             props.HipHeight = inst.HipHeight
             props.RigType = inst.RigType.Name
+        elseif inst:IsA("SurfaceAppearance") then
+            for _, key in ipairs({"ColorMap", "MetalnessMap", "NormalMap", "RoughnessMap"}) do
+                pcall(function()
+                    local value = inst[key]
+                    if value and value ~= "" then props[key] = value end
+                end)
+            end
+            pcall(function() props.AlphaMode = inst.AlphaMode.Name end)
         elseif inst:IsA("DataModelMesh") then
             if inst:IsA("SpecialMesh") then pcall(function() props.MeshType = inst.MeshType.Name end) end
             local mid = ""; pcall(function() mid = inst.MeshId end)
@@ -1076,6 +1101,12 @@ local function serializeInstance(inst)
             local tex = ""; pcall(function() tex = inst.Texture end)
             local ntex = normalizeMeshId(tex); if ntex then props.Texture = ntex end
             if inst:IsA("Decal") then props.Color3 = {inst.Color3.R, inst.Color3.G, inst.Color3.B}; props.Transparency = inst.Transparency end
+            if inst:IsA("Texture") then
+                pcall(function() props.StudsPerTileU = inst.StudsPerTileU end)
+                pcall(function() props.StudsPerTileV = inst.StudsPerTileV end)
+                pcall(function() props.OffsetStudsU = inst.OffsetStudsU end)
+                pcall(function() props.OffsetStudsV = inst.OffsetStudsV end)
+            end
             pcall(function() props.Face = inst.Face.Name end)
         elseif inst:IsA("Shirt") or inst:IsA("Pants") or inst:IsA("ShirtGraphic") then
             local tmpl = ""; pcall(function() tmpl = inst.Template or inst.Graphic end)
