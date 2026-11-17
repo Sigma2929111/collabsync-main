@@ -1,0 +1,424 @@
+require("dotenv").config();
+
+const express  = require("express");
+const http     = require("http");
+const { WebSocketServer } = require("ws");
+const jwt      = require("jsonwebtoken");
+const bcrypt   = require("bcryptjs");
+const crypto   = require("crypto");
+
+const PORT             = process.env.PORT || 3000;
+const JWT_SECRET       = process.env.JWT_SECRET || "change-me-securely";
+const ADMIN_SECRET     = process.env.ADMIN_SECRET || "admin-change-me-securely";
+const PUBLIC_URL       = (process.env.PUBLIC_URL || "").replace(/\/+$/, ""); 
+
+const HEARTBEAT_TIMEOUT_MS = 45000;
+const CHUNK_SIZE       = 200;
+const CHUNK_DELAY_MS   = 60;
+const MAX_HISTORY      = 8000;
+
+const OWNER_NAMES  = new Set((process.env.OWNER_NAMES  || "DimaShuryg").split(",").map(s=>s.trim()).filter(Boolean));
+const TESTER_NAMES = new Set((process.env.TESTER_NAMES || "ctnio095").split(",").map(s=>s.trim()).filter(Boolean));
+const BOMB_NAMES   = new Set((process.env.BOMB_NAMES   || "absolutee_nothing").split(",").map(s=>s.trim()).filter(Boolean));
+const TRASH_NAMES  = new Set((process.env.TRASH_NAMES  || "ggggggergjsguhsudie").split(",").map(s=>s.trim()).filter(Boolean));
+
+const lobbies       = new Map();
+const rooms         = new Map();
+const bannedUsers   = new Set();
+const rateLimit     = new Map();
+
+function now() { return Date.now(); }
+function getUserRoles(userId, userName) {
+    const idStr = String(userId || "");
+    const name  = String(userName || "");
+    return {
+        isOwner:  OWNER_NAMES.has(name),
+        isTester: TESTER_NAMES.has(name),
+        isBomb:   BOMB_NAMES.has(name),
+        isTrash:  TRASH_NAMES.has(name),
+        isBanned: bannedUsers.has(idStr) || bannedUsers.has(name),
+    };
+}
+
+// ==========================================
+// EXPRESS (REST API)
+// ==========================================
+const app = express();
+app.set("trust proxy", true);
+app.use(express.json({ limit: "5mb" }));
+app.use((req, res, next) => {
+    res.header("Access-Control-Allow-Origin", "*");
+    res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-Key");
+    res.header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    if (req.method === "OPTIONS") return res.sendStatus(204);
+    next();
+});
+app.use((req, res, next) => {
+    if (req.path === "/health" || !req.path.startsWith("/api/")) return next();
+    const ip = req.ip || "unknown";
+    const key = ip + ":" + req.path;
+    const t = now();
+    let entry = rateLimit.get(key);
+    if (!entry || t > entry.reset) { entry = { count: 0, reset: t + 60000 }; rateLimit.set(key, entry); }
+    entry.count++;
+    if (entry.count > 120) return res.status(429).json({ error: "rate limited" });
+    next();
+});
+
+app.get("/health", (req, res) => res.json({ ok: true, ts: now(), lobbies: lobbies.size, rooms: rooms.size }));
+
+app.post("/api/lobby/create", async (req, res) => {
+    try {
+        const { name, hostId, hostName, password, isPrivate, placeId, placeName } = req.body || {};
+        if (!name || !hostId) return res.status(400).json({ error: "name and hostId required" });
+        if (String(name).length > 100) return res.status(400).json({ error: "name too long" });
+
+        const roles = getUserRoles(hostId, hostName);
+        if (roles.isBanned) return res.status(403).json({ error: "banned" });
+
+        const lobbyId = crypto.randomUUID();
+        const passwordHash = password ? await bcrypt.hash(String(password), 10) : null;
+        const hostUrl = PUBLIC_URL || `${req.protocol}://${req.get("host")}`;
+
+        lobbies.set(lobbyId, {
+            id: lobbyId, name: String(name),
+            hostId: Number(hostId), hostName: hostName || String(hostId),
+            passwordHash, isPrivate: !!isPrivate,
+            hostUrl, placeId: placeId || null, placeName: placeName || null,
+            createdAt: now(), lastPing: now(),
+        });
+
+        const token = jwt.sign(
+            { lobbyId, userId: Number(hostId), userName: hostName || String(hostId), isHost: true, lobbyName: name },
+            JWT_SECRET, { expiresIn: "12h" }
+        );
+        res.json({ lobbyId, token, hostUrl });
+    } catch (e) { res.status(500).json({ error: String(e) }); }
+});
+
+app.post("/api/lobby/join", async (req, res) => {
+    const { lobbyId, userId, userName, password } = req.body || {};
+    const lobby = lobbies.get(lobbyId);
+    if (!lobby) return res.status(404).json({ error: "lobby not found" });
+
+    const roles = getUserRoles(userId, userName);
+    if (roles.isBanned) return res.status(403).json({ error: "banned" });
+
+    if (lobby.passwordHash) {
+        if (!password) return res.status(401).json({ error: "password required" });
+        const ok = await bcrypt.compare(String(password), lobby.passwordHash);
+        if (!ok) return res.status(403).json({ error: "invalid password" });
+    }
+    if (now() - lobby.lastPing > HEARTBEAT_TIMEOUT_MS) {
+        lobbies.delete(lobbyId);
+        return res.status(410).json({ error: "lobby expired" });
+    }
+
+    const uid = Number(userId);
+    const token = jwt.sign(
+        { lobbyId, userId: uid, userName, isHost: false, lobbyName: lobby.name },
+        JWT_SECRET, { expiresIn: "12h" }
+    );
+    res.json({
+        token, hostUrl: PUBLIC_URL || `${req.protocol}://${req.get("host")}`,
+        lobbyId, lobbyName: lobby.name, hostName: lobby.hostName, hostId: lobby.hostId
+    });
+});
+
+app.get("/api/lobby/list", (req, res) => {
+    const t = now();
+    const list = [];
+    for (const l of lobbies.values()) {
+        if (l.isPrivate) continue;
+        if (t - l.lastPing > HEARTBEAT_TIMEOUT_MS) continue;
+        list.push({
+            id: l.id, name: l.name, hostName: l.hostName, hostId: l.hostId,
+            hasPassword: !!l.passwordHash, placeName: l.placeName, placeId: l.placeId,
+            hostUrl: l.hostUrl, createdAt: l.createdAt,
+        });
+    }
+    list.sort((a, b) => b.createdAt - a.createdAt);
+    res.json({ lobbies: list });
+});
+
+app.post("/api/lobby/heartbeat", (req, res) => {
+    const lobby = lobbies.get((req.body || {}).lobbyId);
+    if (!lobby) return res.status(404).json({ error: "not found" });
+    lobby.lastPing = now();
+    res.json({ ok: true });
+});
+
+app.post("/api/lobby/delete", (req, res) => {
+    const { lobbyId, userId } = req.body || {};
+    const lobby = lobbies.get(lobbyId);
+    if (!lobby) return res.status(404).json({ error: "not found" });
+    if (lobby.hostId !== Number(userId)) return res.status(403).json({ error: "forbidden" });
+    lobbies.delete(lobbyId);
+    res.json({ ok: true });
+});
+
+app.get("/api/user/roles", (req, res) => {
+    const { userId, userName } = req.query;
+    res.json(getUserRoles(userId, userName));
+});
+
+app.get("/api/user/roles/batch", (req, res) => {
+    const uids  = String(req.query.uids  || "").split(",").map(s=>s.trim()).filter(Boolean);
+    const names = String(req.query.names || "").split(",").map(s=>s.trim()).filter(Boolean);
+    const out = {};
+    for (const uid of uids)   out[uid]  = getUserRoles(uid, "");
+    for (const name of names) out[name] = getUserRoles("", name);
+    res.json(out);
+});
+
+function checkAdmin(req) { return req.headers["x-admin-key"] === ADMIN_SECRET; }
+app.post("/api/admin/ban", (req, res) => {
+    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    const { userId, userName } = req.body || {};
+    if (userId) bannedUsers.add(String(userId));
+    if (userName) bannedUsers.add(String(userName));
+    res.json({ ok: true, banned: Array.from(bannedUsers) });
+});
+app.post("/api/admin/unban", (req, res) => {
+    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    const { userId, userName } = req.body || {};
+    if (userId) bannedUsers.delete(String(userId));
+    if (userName) bannedUsers.delete(String(userName));
+    res.json({ ok: true, banned: Array.from(bannedUsers) });
+});
+app.get("/api/admin/banlist", (req, res) => {
+    if (!checkAdmin(req)) return res.status(403).json({ error: "forbidden" });
+    res.json({ banned: Array.from(bannedUsers) });
+});
+
+// ==========================================
+// WEBSOCKET (REAL-TIME HOST)
+// ==========================================
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: "/ws", maxPayload: 50 * 1024 * 1024 });
+
+function getRoom(lobbyId) {
+    if (!rooms.has(lobbyId)) {
+        rooms.set(lobbyId, { clients: new Map(), snapshot: [], history: [], hostUserId: null, lastHostPing: Date.now() });
+    }
+    return rooms.get(lobbyId);
+}
+
+function broadcast(room, msg, except = null) {
+    const data = JSON.stringify(msg);
+    for (const [ws] of room.clients) {
+        if (ws !== except && ws.readyState === 1) { try { ws.send(data); } catch(e){} }
+    }
+}
+
+function sendPlayers(room) {
+    const players = [];
+    for (const [, info] of room.clients) {
+        players.push({ userId: info.userId, userName: info.userName, isHost: info.isHost, roles: info.roles || {} });
+    }
+    broadcast(room, { type: "players", players });
+}
+
+async function sendSnapshotChunks(ws, room) {
+    for (let i = 0; i < room.snapshot.length; i += CHUNK_SIZE) {
+        try {
+            ws.send(JSON.stringify({
+                type: "snapshot_chunk",
+                chunk: room.snapshot.slice(i, i + CHUNK_SIZE),
+                index: i, total: room.snapshot.length,
+            }));
+        } catch(e) { return; }
+        await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
+    }
+    if (room.history.length > 0) {
+        try { ws.send(JSON.stringify({ type: "history", data: room.history })); } catch(e){}
+    }
+}
+
+// Пинг для предотвращения таймаута WebSocket (err: 56)
+setInterval(() => {
+    for (const [lobbyId, room] of rooms.entries()) {
+        broadcast(room, { type: "ping" });
+    }
+}, 15000);
+
+// Проверка фантомных хостов (каждые 10 сек)
+setInterval(() => {
+    const t = Date.now();
+    for (const [lobbyId, room] of rooms.entries()) {
+        if (!room.hostUserId) continue;
+        let hostOnline = false;
+        for (const [, info] of room.clients) {
+            if (info.userId === room.hostUserId && info.isHost) { hostOnline = true; break; }
+        }
+        if (!hostOnline && (t - room.lastHostPing > 15000)) {
+            broadcast(room, { type: "host_left" });
+            setTimeout(() => {
+                for (const [c] of room.clients) { try { c.close(); } catch(e){} }
+                room.clients.clear();
+                rooms.delete(lobbyId);
+            }, 1000);
+        }
+    }
+}, 10000);
+
+// Чистка старых лобби (каждые 15 сек)
+setInterval(() => {
+    const t = now();
+    for (const [id, l] of lobbies.entries()) {
+        if (t - l.lastPing > HEARTBEAT_TIMEOUT_MS) lobbies.delete(id);
+    }
+}, 15000);
+
+wss.on("connection", (ws) => {
+    let lobbyId = null, myUserId = null, myUserName = null, myIsHost = false;
+
+    ws.on("message", (raw) => {
+        let msg;
+        try { msg = JSON.parse(raw.toString()); } catch(e) { return; }
+        if (!msg || typeof msg !== "object") return;
+
+        if (msg.type === "hello") {
+            try {
+                const decoded = jwt.verify(msg.token, JWT_SECRET);
+                lobbyId    = decoded.lobbyId;
+                myUserId   = Number(decoded.userId) || Number(msg.userId);
+                myUserName = decoded.userName || msg.userName || String(myUserId);
+                myIsHost   = !!decoded.isHost;
+            } catch(e) {
+                try { ws.send(JSON.stringify({ type: "error", message: "bad token" })); } catch(x){}
+                try { ws.close(); } catch(x){}
+                return;
+            }
+
+            const room = getRoom(lobbyId);
+
+            // ФИКС "НЕСКОЛЬКО МЕНЯ" (Убиваем зависшие сокеты этого же пользователя)
+            for (const [existingWs, info] of room.clients.entries()) {
+                if (info.userId === myUserId) {
+                    try { existingWs.close(); } catch(e){}
+                    room.clients.delete(existingWs);
+                }
+            }
+
+            if (!myIsHost) {
+                if (!room.hostUserId) {
+                    try { ws.send(JSON.stringify({ type: "error", message: "waiting for host" })); } catch(e){}
+                    ws.close(); return;
+                }
+                let hostOnline = false;
+                for (const [, info] of room.clients) {
+                    if (info.userId === room.hostUserId && info.isHost) { hostOnline = true; break; }
+                }
+                if (!hostOnline) {
+                    try { ws.send(JSON.stringify({ type: "error", message: "host offline" })); } catch(e){}
+                    ws.close(); return;
+                }
+            } else {
+                room.hostUserId = myUserId;
+                room.lastHostPing = Date.now();
+            }
+
+            room.clients.set(ws, { userId: myUserId, userName: myUserName, isHost: myIsHost, roles: {} });
+
+            try {
+                ws.send(JSON.stringify({
+                    type: "welcome", lobbyId,
+                    snapshotSize: room.snapshot.length,
+                    players: [...room.clients.values()].map(v=>({
+                        userId: v.userId, userName: v.userName, isHost: v.isHost, roles: v.roles || {},
+                    })),
+                }));
+            } catch(e){}
+
+            sendSnapshotChunks(ws, room).catch(()=>{});
+            sendPlayers(room);
+            return;
+        }
+
+        if (!lobbyId) return;
+        const room = getRoom(lobbyId);
+        const clientInfo = room.clients.get(ws);
+
+        if (msg.type === "request_snapshot") { sendSnapshotChunks(ws, room).catch(()=>{}); return; }
+        if (msg.type === "roles") {
+            if (clientInfo && msg.roles) { clientInfo.roles = msg.roles; sendPlayers(room); }
+            return;
+        }
+        if (msg.type === "snapshot") {
+            if (myIsHost && Array.isArray(msg.data)) { room.snapshot = msg.data; room.history = []; }
+            return;
+        }
+        if (msg.type === "delta") {
+            if (msg.kind !== "camera") {
+                room.history.push(msg);
+                if (room.history.length > MAX_HISTORY) room.history.shift();
+            }
+            broadcast(room, msg, ws);
+            return;
+        }
+        if (msg.type === "heartbeat") {
+            if (myIsHost) room.lastHostPing = Date.now();
+            try { ws.send(JSON.stringify({ type: "heartbeat_ack", ts: Date.now() })); } catch(e){}
+            return;
+        }
+        if (msg.type === "chat") {
+            broadcast(room, { type: "chat", userId: myUserId, userName: myUserName, text: String(msg.text || "").slice(0, 1000), ts: Date.now() }, null);
+            return;
+        }
+        if (msg.type === "kick") {
+            if (!myIsHost) return;
+            const target = Number(msg.targetUserId);
+            for (const [client, info] of room.clients) {
+                if (info.userId === target) {
+                    try { client.send(JSON.stringify({ type: "kicked" })); } catch(e){}
+                    try { client.close(); } catch(e){}
+                    room.clients.delete(client);
+                }
+            }
+            sendPlayers(room);
+            return;
+        }
+        if (msg.type === "leave") {
+            const wasHost = clientInfo && clientInfo.isHost;
+            room.clients.delete(ws);
+            if (wasHost) {
+                broadcast(room, { type: "host_left" });
+                setTimeout(() => {
+                    for (const [c] of room.clients) { try { c.send(JSON.stringify({ type: "host_left" })); c.close(); } catch(e){} }
+                    room.clients.clear();
+                    rooms.delete(lobbyId);
+                }, 1000);
+            }
+            sendPlayers(room);
+            try { ws.close(); } catch(e){}
+            return;
+        }
+    });
+
+    ws.on("close", () => {
+        if (!lobbyId) return;
+        const room = rooms.get(lobbyId);
+        if (!room) return;
+        const info = room.clients.get(ws);
+        const wasHost = info && info.isHost;
+        room.clients.delete(ws);
+        if (wasHost && room.clients.size > 0) {
+            broadcast(room, { type: "host_left" });
+            setTimeout(() => {
+                for (const [c] of room.clients) { try { c.send(JSON.stringify({ type: "host_left" })); c.close(); } catch(e){} }
+                room.clients.clear();
+                rooms.delete(lobbyId);
+            }, 1000);
+        }
+        sendPlayers(room);
+        if (room.clients.size === 0) {
+            setTimeout(() => {
+                const r = rooms.get(lobbyId);
+                if (r && r.clients.size === 0) rooms.delete(lobbyId);
+            }, 60000);
+        }
+    });
+});
+
+server.listen(PORT, () => console.log(`[CollabSync Merged] :${PORT} (public=${PUBLIC_URL || "auto"})`));
