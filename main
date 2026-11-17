@@ -2296,7 +2296,14 @@ startHeartbeat = function()
         while State.session do
             if State.wsClient then pcall(function() State.wsClient:Send(HttpService:JSONEncode({type="heartbeat", userId=MY_ID})) end) end
             if State.session.lobbyId and State.session.lobbyId ~= "direct" then
-                pcall(function() httpJson(CATALOG_URL.."/api/lobby/heartbeat", "POST", {lobbyId=State.session.lobbyId}) end)
+                if State.session and State.session.token then
+                pcall(function()
+                    httpJson(CATALOG_URL.."/api/lobby/heartbeat", "POST", {lobbyId=State.session.lobbyId}, {
+                        ["Content-Type"]="application/json",
+                        ["Authorization"]="Bearer "..State.session.token
+                    })
+                end)
+            end
             end
             task.wait(HEARTBEAT_INTERVAL)
         end
@@ -2318,7 +2325,14 @@ end
 
 exitLobbyUI = function()
     if State.session and State.session.isHost then
-        pcall(function() httpJson(CATALOG_URL.."/api/lobby/delete", "POST", {lobbyId=State.session.lobbyId, userId=MY_ID}) end)
+        if State.session.token then
+            pcall(function()
+                httpJson(CATALOG_URL.."/api/lobby/delete", "POST", {lobbyId=State.session.lobbyId}, {
+                    ["Content-Type"]="application/json",
+                    ["Authorization"]="Bearer "..State.session.token
+                })
+            end)
+        end
     end
     stopSession()
     InPlace.Visible = false
