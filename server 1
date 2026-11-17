@@ -146,16 +146,32 @@ app.post("/api/lobby/heartbeat", (req, res) => {
     const { lobbyId } = req.body || {};
     const lobby = lobbies.get(lobbyId);
     if (!lobby) return res.status(404).json({ error: "not found" });
+    const auth = String(req.headers.authorization || "");
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    let decoded;
+    try { decoded = jwt.verify(token, JWT_SECRET); } catch (_) {
+        return res.status(401).json({ error: "unauthorized" });
+    }
+    if (!decoded.isHost || decoded.lobbyId !== lobbyId || Number(decoded.userId) !== lobby.hostId) {
+        return res.status(403).json({ error: "forbidden" });
+    }
     lobby.lastPing = now();
     res.json({ ok: true });
 });
 
 app.post("/api/lobby/delete", (req, res) => {
-    const { lobbyId, userId } = req.body || {};
+    const { lobbyId } = req.body || {};
     const lobby = lobbies.get(lobbyId);
     if (!lobby) return res.status(404).json({ error: "not found" });
-    // Защита: удалить лобби может только его создатель
-    if (lobby.hostId !== Number(userId)) return res.status(403).json({ error: "forbidden" });
+    const auth = String(req.headers.authorization || "");
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    let decoded;
+    try { decoded = jwt.verify(token, JWT_SECRET); } catch (_) {
+        return res.status(401).json({ error: "unauthorized" });
+    }
+    if (!decoded.isHost || decoded.lobbyId !== lobbyId || Number(decoded.userId) !== lobby.hostId) {
+        return res.status(403).json({ error: "forbidden" });
+    }
     lobbies.delete(lobbyId);
     res.json({ ok: true });
 });
