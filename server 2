@@ -346,8 +346,14 @@ wss.on("connection", (ws) => {
         
         if (msg.type === "delta") {
             if (!clientInfo || !ALLOWED_DELTA_KINDS.has(msg.kind)) return;
-            if (clientInfo.isTester && msg.kind !== "camera") return;
-            if (!clientInfo.isHost && !canApplyDelta(clientInfo.permissions, msg)) return;
+            if (clientInfo.isTester && msg.kind !== "camera") {
+                try { ws.send(JSON.stringify({type:"permission_denied", action:msg.kind, id:msg.id})); } catch (_) {}
+                return;
+            }
+            if (!clientInfo.isHost && !canApplyDelta(clientInfo.permissions, msg)) {
+                try { ws.send(JSON.stringify({type:"permission_denied", action:msg.kind, id:msg.id})); } catch (_) {}
+                return;
+            }
             if (typeof msg.id !== "string" || msg.id.length > 128) return;
             if (msg.kind !== "camera" && (typeof msg.id !== "string" || !msg.id)) return;
             // The protected target is the delta id; never trust a client-supplied lock alias.
@@ -396,7 +402,11 @@ wss.on("connection", (ws) => {
         }
 
         if (msg.type === "lock_request") {
-            if (!clientInfo || clientInfo.isTester || (!clientInfo.isHost && !["edit","delete","move","add"].some(key => clientInfo.permissions?.[key] === true)) || typeof msg.objectId !== "string" || !msg.objectId || msg.objectId.length > 128) return;
+            if (!clientInfo || typeof msg.objectId !== "string" || !msg.objectId || msg.objectId.length > 128) return;
+            if (clientInfo.isTester || (!clientInfo.isHost && !["edit","delete","move","add"].some(key => clientInfo.permissions?.[key] === true))) {
+                try { ws.send(JSON.stringify({type:"permission_denied", action:"lock", objectId:msg.objectId})); } catch (_) {}
+                return;
+            }
             if (!room.locks) room.locks = new Map();
             const objectId = msg.objectId;
             const current = room.locks.get(objectId);
@@ -427,7 +437,11 @@ wss.on("connection", (ws) => {
         }
         
         if (msg.type === "chat") {
-            if (!clientInfo || (!clientInfo.isHost && clientInfo.permissions?.chat !== true)) return;
+            if (!clientInfo) return;
+            if (!clientInfo.isHost && clientInfo.permissions?.chat !== true) {
+                try { ws.send(JSON.stringify({type:"permission_denied", action:"chat"})); } catch (_) {}
+                return;
+            }
             const chatNow = Date.now();
             if (chatNow - clientInfo.chatWindow.startedAt >= 10000) clientInfo.chatWindow = {startedAt: chatNow, count: 0};
             clientInfo.chatWindow.count++;
