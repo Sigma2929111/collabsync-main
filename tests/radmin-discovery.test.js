@@ -246,7 +246,7 @@ async function stopNodeServer(child) {
 
 async function connectWs(url, token) {
     const socket = new WebSocket(url.replace(/^http:/, "ws:") + "/ws");
-    const welcomePromise = waitForMessage(socket, message => message.type === "welcome");
+    const welcomePromise = waitForMessage(socket, message => message.type === "welcome", 4000, "WebSocket welcome handshake");
     await new Promise((resolve, reject) => {
         socket.once("error", reject);
         socket.once("open", resolve);
@@ -392,6 +392,8 @@ test("split Server 1 + Server 2 persistent workspace survives both service resta
 
         catalog = await startNodeServer("server 1", catalogPort, dataDir);
         host = await startNodeServer("server 2", hostPort, dataDir);
+        const restoredHealth = await (await fetch(hostUrl + "/health")).json();
+        assert.equal(restoredHealth.rooms, 1, "Server 2 must restore the persistent room before owner reconnects");
         const listResponse = await fetch(catalogUrl + "/api/lobby/list");
         assert.equal(listResponse.status, 200);
         const listed = await listResponse.json();
