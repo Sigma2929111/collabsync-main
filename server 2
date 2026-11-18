@@ -169,7 +169,7 @@ wss.on("connection", (ws) => {
             room.persistent = room.persistent || decoded.persistent === true;
             if (!room.permissions) room.permissions = {};
             const myPermissions = normalizePermissions(room.permissions[myUserId]);
-            for (const [oldWs/, info] of room.clients.entries()) {
+            for (const [oldWs, info] of room.clients.entries()) {
                 if (info.userId === myUserId) {
                     try { oldWs.close(); } catch(e) {}
                     room.clients.delete(oldWs);
