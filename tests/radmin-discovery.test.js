@@ -357,7 +357,7 @@ test("split Server 1 + Server 2 persistent workspace survives both service resta
         const snapshot = [{id:"split-object", parentId:"service:Workspace", className:"Part", name:"Persisted", props:{Name:"Persisted"}, attrs:{}}];
         hostSocket.send(JSON.stringify({type:"snapshot", data:snapshot}));
         await new Promise(resolve => setTimeout(resolve, 450));
-        await new Promise(resolve => hostSocket.close(resolve));
+        await new Promise(resolve => { hostSocket.once("close", resolve); hostSocket.close(); });
         hostSocket = null;
         await stopNodeServer(host);
         host = null;
