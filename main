@@ -49,7 +49,7 @@ local formatName, sphereName, nameColor, sphereColor, applyNameStyle, applySpher
 local resolveName, isTester, isLobbyHost
 local refreshMarkerStyle, setupMarkerRotation, updateMarkerRotation
 local connectWebSocket, startHeartbeat, stopSession, exitLobbyUI
-local attemptJoin, card, publishLobby, directConnect, startCatalogPoll
+local attemptJoin, card, publishLobby, startCatalogPoll
 local processPendingMarkers
 local showReviewPrompt
 
@@ -2704,50 +2704,7 @@ publishLobby = function()
 end
 publishBtn.MouseButton1Click:Connect(publishLobby)
 
-directConnect = function()
-    local url = directUrlBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
-    local token = directTokenBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
-    if url == "" or token == "" then showToast(Direct, "Заполните URL и токен", T.danger); return end
-    if not url:match("^https?://") and not url:match("^wss?://") then url = "http://" .. url end
-    local authority = url:match("^https?://([^/]+)") or url:match("^wss?://([^/]+)")
-    if not authority or authority:find("@", 1, true) or authority:find("%s") or url:find("[?#]") then
-        showToast(Direct, "Некорректный адрес сервера", T.danger)
-        return
-    end
-    local port = tonumber(authority:match(":(%d+)$"))
-    if authority:find(":", 1, true) and (not port or port < 1 or port > 65535) then
-        showToast(Direct, "Некорректный порт", T.danger)
-        return
-    end
-    url = url:gsub("/+$", "")
-    if PLUGIN then pcall(function() PLUGIN:SetSetting("cs_radmin_url", url) end) end
 
-    State.session = { lobbyId = "direct", token = token, hostUrl = url, isHost = false }
-    isOwnLobby = false
-    currentLobby = { id = "direct", hostId = 0, hostName = "Direct", whitelist = {} }
-    
-    showLoadingSteps("Прямое подключение", {
-        {label = "Подключение...", fn = function()
-            local ready = false
-            local err = nil
-            connectWebSocket(url, token, false, function() ready = true end, function(e) err = e end)
-            local t = tick()
-            while not ready and not err and tick() - t < 15 do task.wait(0.1) end
-            if err then error(err) end
-            if not ready then error("Таймаут") end
-            return true
-        end}
-    }, function()
-        Main.Visible = false; InPlace.Visible = true; lastVisibleFrame = InPlace
-        ipStatusLbl.Text = "● Прямое подключение"
-        ipSubtitleLbl.Text = url
-        startHeartbeat()
-    end, function(err)
-        showToast(Direct, "Ошибка: " .. tostring(err), T.danger)
-        State.session = nil
-    end)
-end
-directBtn.MouseButton1Click:Connect(directConnect)
 
 startCatalogPoll = function()
     if State.catalogPollThread then task.cancel(State.catalogPollThread) end
