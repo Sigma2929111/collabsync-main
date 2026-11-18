@@ -39,3 +39,8 @@ test("plugin displays server-side permission denial feedback", () => {
     assert.match(pluginSource, /data\.type == "permission_denied"/);
     assert.match(pluginSource, /Недостаточно прав/);
 });
+test("owner review rows show all detected fields with expandable row height", () => {
+    assert.match(pluginSource, /table\.concat\(changes, "; "\)/);
+    assert.match(pluginSource, /math\.ceil\(#description \/ 100\)/);
+    assert.match(pluginSource, /math\.min\(260, math\.max\(58,/);
+});
