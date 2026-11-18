@@ -1454,6 +1454,14 @@ round(directTokenBox, 8); outline(directTokenBox, T.border, 1); pad(directTokenB
 
 local directBtn = btn(Direct, "Подключиться", {size=UDim2.new(1,0,0,44), pos=UDim2.fromOffset(0,186), bg=T.accent, hoverBg=T.accent2, textSize=14})
 
+-- Restore only the last Radmin address; never persist session tokens.
+if PLUGIN then
+    pcall(function()
+        local savedUrl = PLUGIN:GetSetting("cs_radmin_url")
+        if type(savedUrl) == "string" then directUrlBox.Text = savedUrl end
+    end)
+end
+
 lbl(Direct, "Инструкция для Радмина:\n1. Создатель вводит свой Radmin IP в поле 'Server 2 URL' при создании.\n2. Друг вводит этот же IP и полученный токен сюда.\n3. Сервер должен быть запущен на ПК создателя (или на хосте с Radmin IP).", {textSize=11, color=T.muted, wrapped=true, size=UDim2.new(1,0,0,60), pos=UDim2.fromOffset(0,240)})
 
 local switchTo
@@ -2418,10 +2426,23 @@ end
 publishBtn.MouseButton1Click:Connect(publishLobby)
 
 directConnect = function()
-    local url = directUrlBox.Text
-    local token = directTokenBox.Text
+    local url = directUrlBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
+    local token = directTokenBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
     if url == "" or token == "" then showToast(Direct, "Заполните URL и токен", T.danger); return end
-    
+    if not url:match("^https?://") and not url:match("^wss?://") then url = "http://" .. url end
+    local authority = url:match("^https?://([^/]+)") or url:match("^wss?://([^/]+)")
+    if not authority or authority:find("@", 1, true) or authority:find("%s") or url:find("[?#]") then
+        showToast(Direct, "Некорректный адрес сервера", T.danger)
+        return
+    end
+    local port = tonumber(authority:match(":(%d+)$"))
+    if authority:find(":", 1, true) and (not port or port < 1 or port > 65535) then
+        showToast(Direct, "Некорректный порт", T.danger)
+        return
+    end
+    url = url:gsub("/+$", "")
+    if PLUGIN then pcall(function() PLUGIN:SetSetting("cs_radmin_url", url) end) end
+
     State.session = { lobbyId = "direct", token = token, hostUrl = url, isHost = false }
     isOwnLobby = false
     currentLobby = { id = "direct", hostId = 0, hostName = "Direct", whitelist = {} }
