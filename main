@@ -1792,9 +1792,9 @@ round(permsBody, 10); outline(permsBody, T.border, 1); pad(permsBody, 10)
 local permList = I("Frame", {Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1}, permsBody)
 I("UIListLayout", {Padding=UDim.new(0,8)}, permList)
 
-local permNames = {"Редакт.", "Удалять", "Двигать", "Добавлять"}
+local permNames = {"Редакт.", "Удалять", "Двигать", "Добавлять", "Чат", "Камера", "Выбор"}
 local permRow = function(uid, name, defaults, isHostRow)
-    local r = I("Frame", {Size=UDim2.new(1,0,0,52), BackgroundColor3=T.surf2, BorderSizePixel=0}, permList)
+    local r = I("Frame", {Size=UDim2.new(1,0,0,94), BackgroundColor3=T.surf2, BorderSizePixel=0}, permList)
     round(r, 8)
     avatar(r, 28, uid).Position = UDim2.fromOffset(6,12)
     local nLbl = lbl(r, formatName(uid), {textSize=13, size=UDim2.new(1,-360,1,0), pos=UDim2.fromOffset(44,0), truncate=true})
@@ -1807,14 +1807,14 @@ local permRow = function(uid, name, defaults, isHostRow)
         kickBtn.MouseButton1Click:Connect(function() kickPlayer(uid) end)
     end
     
-    local cbox = I("Frame", {Size=UDim2.new(0,270,1,0), Position=UDim2.new(1,-270,0,0), BackgroundTransparency=1}, r)
-    I("UIListLayout", {FillDirection=Enum.FillDirection.Horizontal, Padding=UDim.new(0,6), VerticalAlignment=Enum.VerticalAlignment.Center, HorizontalAlignment=Enum.HorizontalAlignment.Right}, cbox)
-    local selected = {true, true, true, true}
-    for index = 1, 4 do selected[index] = (defaults and defaults[index]) == true end
+    local cbox = I("Frame", {Size=UDim2.fromOffset(270,82), Position=UDim2.new(1,-270,0.5,-41), BackgroundTransparency=1}, r)
+    I("UIGridLayout", {CellSize=UDim2.fromOffset(82,24), CellPadding=UDim2.fromOffset(4,4), FillDirectionMaxCells=3, HorizontalAlignment=Enum.HorizontalAlignment.Right, VerticalAlignment=Enum.VerticalAlignment.Center}, cbox)
+    local selected = {true, true, true, true, true, true, true}
+    for index = 1, #permNames do selected[index] = (defaults and defaults[index]) == true end
     
     for i, pname in ipairs(permNames) do
         local on = selected[i]
-        local chip = I("Frame", {Size=UDim2.fromOffset(62,26), BackgroundColor3=on and T.success or T.surf3, BorderSizePixel=0}, cbox)
+        local chip = I("Frame", {Size=UDim2.fromOffset(82,24), BackgroundColor3=on and T.success or T.surf3, BorderSizePixel=0}, cbox)
         round(chip, 6)
         lbl(chip, pname, {textSize=10, xAlign=Enum.TextXAlignment.Center, color=on and Color3.new(1,1,1) or T.muted, size=UDim2.fromScale(1,1)})
         local cb = I("TextButton", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text="", ZIndex=5}, chip)
@@ -1827,7 +1827,7 @@ local permRow = function(uid, name, defaults, isHostRow)
             chip.BackgroundColor3 = isOn and T.success or T.surf3
             chip:FindFirstChildOfClass("TextLabel").TextColor3 = isOn and Color3.new(1,1,1) or T.muted
             if State.wsClient and State.connected then
-                local permissions = {edit=selected[1], delete=selected[2], move=selected[3], add=selected[4]}
+                local permissions = {edit=selected[1], delete=selected[2], move=selected[3], add=selected[4], chat=selected[5], camera=selected[6], select=selected[7]}
                 pcall(function()
                     State.wsClient:Send(HttpService:JSONEncode({type="permissions_update", targetUserId=uid, permissions=permissions}))
                 end)
@@ -1843,8 +1843,8 @@ refreshPerms = function()
     if #players == 0 then players = {{userId=MY_ID, userName=MY_NAME, isHost=isOwnLobby, roles=MY_ROLES}} end
     for _, p in ipairs(players) do
         local isHostRow = p.isHost or isLobbyHost(p.userId)
-        local permissions = p.permissions or {edit=true, delete=true, move=true, add=true}
-        permRow(p.userId, formatName(p.userId), {permissions.edit == true, permissions.delete == true, permissions.move == true, permissions.add == true}, isHostRow)
+        local permissions = p.permissions or {edit=true, delete=true, move=true, add=true, chat=true, camera=true, select=true}
+        permRow(p.userId, formatName(p.userId), {permissions.edit == true, permissions.delete == true, permissions.move == true, permissions.add == true, permissions.chat == true, permissions.camera == true, permissions.select == true}, isHostRow)
     end
 end
 
