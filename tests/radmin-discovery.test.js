@@ -297,6 +297,14 @@ test("Server 1 and Server 2 support a real two-client collaboration session", as
         const afterUnlock = waitForMessage(hostSocket, message => message.type === "delta" && message.id === "locked-edit", 4000, "edit after lock release");
         guestSocket.send(JSON.stringify({type:"delta", id:"locked-edit", objectId:"locked-edit", kind:"update", props:{Name:"allowed after unlock"}}));
         assert.equal((await afterUnlock).userId, 120002);
+
+        const guestOwnedLock = waitForMessage(hostSocket, message => message.type === "lock_state" && message.objectId === "guest-disconnect-lock" && message.lock?.userId === 120002, 4000, "guest-owned lock");
+        guestSocket.send(JSON.stringify({type:"lock_request", objectId:"guest-disconnect-lock"}));
+        await guestOwnedLock;
+        const releasedOnDisconnect = waitForMessage(hostSocket, message => message.type === "lock_state" && message.objectId === "guest-disconnect-lock" && message.lock === null, 4000, "split lock release after disconnect");
+        guestSocket.close();
+        await releasedOnDisconnect;
+        guestSocket = null;
     } finally {
         for (const socket of [hostSocket, guestSocket]) {
             if (socket && socket.readyState !== WebSocket.CLOSED) socket.close();
