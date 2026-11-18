@@ -2616,7 +2616,7 @@ publishLobby = function()
     local hostUrl = createServ2Box.Text
     if hostUrl == "" then hostUrl = DEFAULT_HOST_URL end
     -- Prefer a locally running Server 2 and detect its Radmin adapter automatically.
-    for _, localPort in ipairs({3001, 3000}) do
+    for _, localPort in ipairs({3001}) do
         local probeOk, probeResponse = pcall(function()
             return HttpService:RequestAsync({Url="http://127.0.0.1:"..localPort.."/network-info", Method="GET"})
         end)
