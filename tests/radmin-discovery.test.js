@@ -601,7 +601,7 @@ test("Server 2-in-1 enforces member ACL and object claims", async () => {
         hostSocket.send(JSON.stringify({type:"permissions_update", targetUserId:150002, permissions:{edit:false, delete:false, move:false, add:false}}));
         await Promise.all([lockReleased, revokedNotice]);
         const regrantNotice = waitForMessage(guestSocket, m => m.type === "players" && m.players.some(p => p.userId === 150002 && p.permissions?.edit === true && p.permissions?.delete === true && p.permissions?.move === true && p.permissions?.add === true), 4000, "member permissions restored");
-        hostSocket.send(JSON.stringify({type:"permissions_update", targetUserId:150002, permissions:{edit:true, delete:true, move:true, add:true}});
+        hostSocket.send(JSON.stringify({type:"permissions_update", targetUserId:150002, permissions:{edit:true, delete:true, move:true, add:true}}));
         await regrantNotice;
 
         const lockState = waitForMessage(guestSocket, m => m.type === "lock_state" && m.objectId === "combined-object" && m.lock?.userId === 150001, 4000, "combined lock state");
