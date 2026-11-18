@@ -2189,8 +2189,19 @@ connectWebSocket = function(hostUrl, token, isHost, onReady, onFail, isReconnect
             
         elseif data.type == "history" then
             task.spawn(function()
+                while State.applyingSnapshot do task.wait(0.1) end
                 for _, delta in ipairs(data.data or {}) do
                     if delta.kind ~= "camera" then applyDelta(delta) end
+                end
+                -- После восстановления истории владелец фиксирует объединённое состояние,
+                -- чтобы сервер не проигрывал те же события при каждом следующем подключении.
+                if State.session and State.session.isHost and State.session.persistent and State.wsClient == client then
+                    task.wait(0.5)
+                    local compacted = buildSnapshot()
+                    local sent = pcall(function()
+                        client:Send(HttpService:JSONEncode({type="snapshot", data=compacted}))
+                    end)
+                    if sent then logMsg("lobby", "info", "История применена и сохранена в новый snapshot: "..#compacted.." объектов") end
                 end
             end)
             
