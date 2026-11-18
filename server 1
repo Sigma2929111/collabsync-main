@@ -66,10 +66,11 @@ app.get("/health", (req, res) => res.json({ ok: true, ts: now(), lobbies: lobbie
 app.post("/api/lobby/create", async (req, res) => {
     try {
         const { name, hostId, hostName, password, isPrivate, hostUrl, placeId, placeName } = req.body || {};
-        if (!name || !hostId) return res.status(400).json({ error: "name and hostId required" });
+        const hostUid = Number(hostId);
+        if (!name || !Number.isSafeInteger(hostUid) || hostUid <= 0) return res.status(400).json({ error: "valid name and hostId required" });
         if (String(name).length > 100) return res.status(400).json({ error: "name too long" });
         
-        const roles = getUserRoles(hostId, hostName);
+        const roles = getUserRoles(hostUid, hostName);
         if (roles.isBanned) return res.status(403).json({ error: "banned" });
         if (roles.isTester) return res.status(403).json({ error: "testers are read-only and cannot host edit lobbies" });
         
@@ -78,7 +79,7 @@ app.post("/api/lobby/create", async (req, res) => {
         
         const lobby = {
             id: lobbyId, name: String(name),
-            hostId: Number(hostId), hostName: hostName || String(hostId),
+            hostId: hostUid, hostName: String(hostName || hostUid).slice(0, 32),
             passwordHash, isPrivate: !!isPrivate,
             hostUrl: hostUrl || null, placeId: placeId || null, placeName: placeName || null,
             createdAt: now(), lastPing: now(),
@@ -96,10 +97,13 @@ app.post("/api/lobby/create", async (req, res) => {
 
 app.post("/api/lobby/join", async (req, res) => {
     const { lobbyId, userId, userName, password } = req.body || {};
+    const uid = Number(userId);
+    if (!lobbyId || !Number.isSafeInteger(uid) || uid <= 0) return res.status(400).json({ error: "valid lobbyId and userId required" });
     const lobby = lobbies.get(lobbyId);
     if (!lobby) return res.status(404).json({ error: "lobby not found" });
-    
-    const roles = getUserRoles(userId, userName);
+
+    const safeName = String(userName || uid).slice(0, 32);
+    const roles = getUserRoles(uid, safeName);
     if (roles.isBanned) return res.status(403).json({ error: "banned" });
     
     if (lobby.passwordHash) {
@@ -113,10 +117,9 @@ app.post("/api/lobby/join", async (req, res) => {
         return res.status(410).json({ error: "lobby expired" });
     }
     
-    const uid = Number(userId);
     // JWT для гостя строго содержит isHost: false
     const token = jwt.sign({ 
-        lobbyId, userId: uid, userName, isHost: false, isTester: roles.isTester, lobbyName: lobby.name 
+        lobbyId, userId: uid, userName: safeName, isHost: false, isTester: roles.isTester, lobbyName: lobby.name 
     }, JWT_SECRET, { expiresIn: "12h" });
     
     res.json({ token, hostUrl: lobby.hostUrl, lobbyId, lobbyName: lobby.name, hostName: lobby.hostName });
