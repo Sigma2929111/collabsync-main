@@ -333,7 +333,7 @@ wss.on("connection", (ws) => {
             if (!clientInfo.isHost && !canApplyDelta(clientInfo.permissions, msg)) return;
             if (typeof msg.id !== "string" || msg.id.length > 128) return;
             if (msg.kind !== "camera" && (typeof msg.id !== "string" || !msg.id)) return;
-            const lockId = String(msg.id || "");
+            const lockId = String(msg.objectId || msg.id || "");
             const objectLock = room.locks?.get(lockId);
             if (objectLock && objectLock.expiresAt > Date.now() && objectLock.userId !== clientInfo.userId) {
                 try { ws.send(JSON.stringify({type:"lock_conflict", objectId:lockId, userId:objectLock.userId, userName:objectLock.userName, expiresAt:objectLock.expiresAt})); } catch (_) {}
