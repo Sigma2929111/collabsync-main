@@ -2014,7 +2014,7 @@ showReviewPrompt = function(snapshotItems, historyItems)
         if value == nil then return "—" end
         local ok, encoded = pcall(function() return HttpService:JSONEncode(value) end)
         local textValue = ok and encoded or tostring(value)
-        if #textValue > 64 then textValue = string.sub(textValue, 1, 61) .. "..." end
+        if #textValue > 120 then textValue = string.sub(textValue, 1, 117) .. "..." end
         return textValue
     end
     local function describeDelta(delta)
