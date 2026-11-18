@@ -362,6 +362,20 @@ test("persistent workspace backup, restore, restart and owner rejoin work end-to
         const ownerConnection = await connectWs(base, ownerJoin.token);
         hostSocket = ownerConnection.socket;
         assert.equal(ownerConnection.welcome.snapshotSize, 1);
+
+        const backupHeaders = {"Content-Type":"application/json", "Authorization":"Bearer "+ownerJoin.token};
+        const backupCreateResponse = await fetch(hostUrl + "/api/workspace/backups/create", {
+            method:"POST", headers:backupHeaders, body:JSON.stringify({lobbyId:created.lobbyId}),
+        });
+        assert.equal(backupCreateResponse.status, 200);
+        const splitBackup = await backupCreateResponse.json();
+        assert.ok(splitBackup.backup && splitBackup.backup.id);
+        const backupListResponse = await fetch(hostUrl + "/api/workspace/"+created.lobbyId+"/backups", {headers:backupHeaders});
+        assert.equal(backupListResponse.status, 200);
+        const splitBackupList = await backupListResponse.json();
+        assert.ok(splitBackupList.backups.some(item => item.id === splitBackup.backup.id));
+        const activityResponse = await fetch(hostUrl + "/api/workspace/"+created.lobbyId+"/activity", {headers:backupHeaders});
+        assert.equal(activityResponse.status, 200);
     } finally {
         for (const socket of [hostSocket, guestSocket]) {
             if (socket && socket.readyState !== WebSocket.CLOSED) socket.close();
