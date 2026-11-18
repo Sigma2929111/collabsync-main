@@ -257,7 +257,7 @@ wss.on("connection", (ws) => {
             const wasHost = clientInfo && clientInfo.isHost;
             room.clients.delete(ws);
             
-            if (wasHost) {
+            if (wasHost && !room.persistent) {
                 broadcast(room, {type:"host_left"});
                 setTimeout(() => {
                     for (const [c] of room.clients) { 
