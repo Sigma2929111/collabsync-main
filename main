@@ -1080,7 +1080,7 @@ end
 local function sendDelta(kind, data)
     if not State.wsClient or not State.connected then return false end
     if MY_ROLES.isTester and kind ~= "camera" then return false end
-    local payload = {type="delta", id=HttpService:GenerateGUID(false), kind=kind, userId=MY_ID, userName=MY_NAME, ts=os.time()}
+    local payload = {type="delta", id=HttpService:GenerateGUID(false), objectId=data.id or data.objectId, kind=kind, userId=MY_ID, userName=MY_NAME, ts=os.time()}
     for k, v in pairs(data) do payload[k] = v end
     pcall(function() State.wsClient:Send(HttpService:JSONEncode(payload)) end)
 end
