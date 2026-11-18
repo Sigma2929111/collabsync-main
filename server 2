@@ -340,7 +340,11 @@ wss.on("connection", (ws) => {
             if (msg.kind !== "camera") {
                 room.history.push(trustedDelta);
                 if (room.history.length > MAX_HISTORY) room.history.shift();
-                if (room.persistent) schedulePersist();
+                if (room.persistent) {
+                    room.activity.push({id:msg.id, kind:msg.kind, userId:clientInfo.userId, userName:clientInfo.userName, ts:Date.now(), objectName:typeof msg.name === "string" ? msg.name.slice(0,100) : null});
+                    if (room.activity.length > 500) room.activity.shift();
+                    schedulePersist();
+                }
             }
             broadcast(room, trustedDelta, ws);
             return;
@@ -443,6 +447,19 @@ wss.on("connection", (ws) => {
     });
 });
 
+const backupTimer = setInterval(() => {
+    const currentTime = Date.now();
+    for (const room of rooms.values()) {
+        const settings = room.backupSettings;
+        if (!room.persistent || !settings?.enabled || !room.snapshot.length) continue;
+        if (currentTime - Number(settings.lastBackupAt || 0) < Number(settings.intervalMs || 86400000)) continue;
+        const backup = {id:crypto.randomUUID(), createdAt:currentTime, reason:"automatic", snapshot:room.snapshot, history:room.history.slice(-MAX_HISTORY), snapshotSize:room.snapshot.length};
+        room.backups = [...(room.backups || []), backup].slice(-(settings.retention || 20));
+        settings.lastBackupAt = currentTime;
+        schedulePersist();
+    }
+}, 60000);
+
 const healthTimer = setInterval(() => {
     const url = HOST_PUBLIC_URL ? HOST_PUBLIC_URL + "/health" : `http://localhost:${PORT}/health`;
     fetch(url).catch(()=>{});
@@ -452,6 +469,7 @@ async function shutdown(signal) {
     console.log(`[Shutdown] ${signal}: flushing persistent rooms...`);
     clearInterval(cleanupTimer);
     clearInterval(healthTimer);
+    clearInterval(backupTimer);
     try { await flushPersistentRooms(); }
     catch (e) { console.error("[Shutdown] persistence flush failed:", e.message); process.exitCode = 1; }
     for (const ws of wss.clients) { try { ws.close(1001, "server shutting down"); } catch (_) {} }
