@@ -9,6 +9,9 @@ function normalizePermissions(input, fallback = DEFAULT_PERMISSIONS) {
         delete: typeof source.delete === "boolean" ? source.delete : fallback.delete === true,
         move: typeof source.move === "boolean" ? source.move : fallback.move === true,
         add: typeof source.add === "boolean" ? source.add : fallback.add === true,
+        chat: typeof source.chat === "boolean" ? source.chat : fallback.chat === true,
+        camera: typeof source.camera === "boolean" ? source.camera : fallback.camera === true,
+        select: typeof source.select === "boolean" ? source.select : fallback.select === true,
     };
 }
 
