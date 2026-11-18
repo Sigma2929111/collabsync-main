@@ -46,13 +46,13 @@ local watchInstance, createLocalMarker, updateLocalMarker, destroyLocalMarker
 local applyDelta, onSelectionChanged, protectMarker
 local kickPlayer, refreshPlayerList, refreshPerms, refreshWhitelist
 local formatName, sphereName, nameColor, sphereColor, applyNameStyle, applySphereStyle
-local resolveName, isTester, isBomb, isOwner, isTrash, isLobbyHost
+local resolveName, isTester, isLobbyHost
 local refreshMarkerStyle, setupMarkerRotation, updateMarkerRotation
 local connectWebSocket, startHeartbeat, stopSession, exitLobbyUI
 local attemptJoin, card, publishLobby, directConnect, startCatalogPoll
 local processPendingMarkers
 
-local MY_ROLES = {isOwner=false, isTester=false, isBomb=false, isTrash=false, isBanned=false}
+local MY_ROLES = {isTester=false, isBanned=false}
 local roleCache = {}
 local roleFetchInFlight = {}
 local markerLocks = {}
@@ -101,12 +101,9 @@ end
 
 fetchRoles(MY_ID, MY_NAME, function(r)
     if r then
-        MY_ROLES.isOwner = r.isOwner or false
-        MY_ROLES.isTester = r.isTester or false
-        MY_ROLES.isBomb = r.isBomb or false
-        MY_ROLES.isTrash = r.isTrash or false
-        MY_ROLES.isBanned = r.isBanned or false
-        logMsg("plugin", "info", "MY_ROLES: owner="..tostring(MY_ROLES.isOwner).." tester="..tostring(MY_ROLES.isTester).." banned="..tostring(MY_ROLES.isBanned))
+        MY_ROLES.isTester = r.isTester == true
+        MY_ROLES.isBanned = r.isBanned == true
+        logMsg("plugin", "info", "MY_ROLES: tester="..tostring(MY_ROLES.isTester).." banned="..tostring(MY_ROLES.isBanned))
         if _G.__collabsync_refresh_styles then pcall(_G.__collabsync_refresh_styles) end
     end
 end)
@@ -287,27 +284,13 @@ end
 getRoles = function(uid)
     if uid == MY_ID then return MY_ROLES end
     for _, p in ipairs(State.remotePlayers or {}) do
-        if p.userId == uid and p.roles and (p.roles.isOwner or p.roles.isTester or p.roles.isBomb or p.roles.isTrash) then
-            return p.roles
+        if p.userId == uid then
+            return {isTester = p.isTester == true or (p.roles and p.roles.isTester == true)}
         end
     end
-    if roleCache[uid] then return roleCache[uid] end
-    if not roleFetchInFlight[uid] then
-        roleFetchInFlight[uid] = true
-        fetchRoles(uid, nil, function(r)
-            roleFetchInFlight[uid] = nil
-            if r then
-                roleCache[uid] = r
-                if _G.__collabsync_refresh_styles then pcall(_G.__collabsync_refresh_styles) end
-            end
-        end)
-    end
-    return {isOwner=false, isTester=false, isBomb=false, isTrash=false}
+    return {isTester = false}
 end
-isTester = function(uid) local r = getRoles(uid); return r and r.isTester or false end
-isBomb = function(uid) local r = getRoles(uid); return r and r.isBomb or false end
-isOwner = function(uid) local r = getRoles(uid); return r and r.isOwner or false end
-isTrash = function(uid) local r = getRoles(uid); return r and r.isTrash or false end
+isTester = function(uid) local r = getRoles(uid); return r and r.isTester == true or false end
 isLobbyHost = function(uid)
     if not uid then return false end
     if currentLobby and currentLobby.hostId and currentLobby.hostId == uid then return true end
@@ -319,110 +302,37 @@ end
 
 nameColor = function(uid)
     if not uid then return T.text end
-    if isOwner(uid) then return T.owner end
     if isLobbyHost(uid) then return T.gold end
     if isTester(uid) then return T.tester end
-    if isTrash(uid) then return T.trash end
-    if isBomb(uid) then return T.bomb end
     return T.text
 end
 sphereColor = function(uid)
     if not uid then return T.text end
     if isLobbyHost(uid) then return T.gold end
     if isTester(uid) then return T.tester end
-    if isTrash(uid) then return T.trash end
-    if isBomb(uid) then return T.bomb end
-    if isOwner(uid) then return T.owner end
     return Color3.fromRGB((uid*17)%150+100, (uid*31)%150+100, (uid*53)%150+100)
 end
 
 formatName = function(uid)
-    local base = resolveName(uid)
-    local prefix, suffix = "", ""
-    if isTrash(uid) then prefix = "🗑️ " end
-    if isLobbyHost(uid) then prefix = "👑 " .. prefix end
-    if isOwner(uid) then prefix = "⭐ " .. prefix end
-    if isTester(uid) then prefix = "🧪 " .. prefix end
-    if isBomb(uid) then suffix = " 💣" end
-    return prefix..base..suffix
+    local prefix = ""
+    if isLobbyHost(uid) then prefix = "👑 " end
+    if isTester(uid) then prefix = prefix .. "🧪 TESTER • " end
+    return prefix .. resolveName(uid)
 end
 
 sphereName = function(uid)
-    return resolveName(uid)
+    return formatName(uid)
 end
 
-local function startGradientAnimator()
-    task.spawn(function()
-        while true do
-            task.wait(0.05)
-            for i = #State.animGradients, 1, -1 do
-                local e = State.animGradients[i]
-                if not e.label or not e.label.Parent or not e.grad then
-                    table.remove(State.animGradients, i)
-                else
-                    e.grad.Rotation = (e.grad.Rotation + 10) % 360
-                end
-            end
-        end
-    end)
-end
-startGradientAnimator()
-
+-- Static labels are cheaper than a permanent per-frame gradient animator.
 applyNameStyle = function(label, uid, noEmoji)
     if not label or not uid then return end
     label.TextColor3 = nameColor(uid)
-    if isBomb(uid) then
-        label.TextStrokeTransparency = 0
-        label.TextStrokeColor3 = Color3.fromRGB(230, 230, 230)
-    end
-    if isTrash(uid) then
-        label.TextStrokeTransparency = 0
-        label.TextStrokeColor3 = Color3.fromRGB(60, 40, 20)
-    end
-    if isOwner(uid) then
-        local grad = Instance.new("UIGradient")
-        grad.Color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0, Color3.fromRGB(255,50,50)),
-            ColorSequenceKeypoint.new(0.17, Color3.fromRGB(255,180,50)),
-            ColorSequenceKeypoint.new(0.33, Color3.fromRGB(255,255,50)),
-            ColorSequenceKeypoint.new(0.5, Color3.fromRGB(50,255,50)),
-            ColorSequenceKeypoint.new(0.66, Color3.fromRGB(50,200,255)),
-            ColorSequenceKeypoint.new(0.83, Color3.fromRGB(130,50,255)),
-            ColorSequenceKeypoint.new(1, Color3.fromRGB(255,50,150)),
-        })
-        grad.Parent = label
-        table.insert(State.animGradients, {label=label, grad=grad})
-    elseif isLobbyHost(uid) or isTester(uid) then
-        local base = nameColor(uid)
-        local brighter = Color3.fromRGB(math.min(255, base.R + 90), math.min(255, base.G + 90), math.min(255, base.B + 90))
-        local grad = Instance.new("UIGradient")
-        grad.Color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0, base),
-            ColorSequenceKeypoint.new(0.5, brighter),
-            ColorSequenceKeypoint.new(1, base),
-        })
-        grad.Parent = label
-        table.insert(State.animGradients, {label=label, grad=grad})
-    end
 end
 
 applySphereStyle = function(label, uid)
     if not label or not uid then return end
     label.TextColor3 = sphereColor(uid)
-    if isOwner(uid) then
-        local grad = Instance.new("UIGradient")
-        grad.Color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0, Color3.fromRGB(255,50,50)),
-            ColorSequenceKeypoint.new(0.17, Color3.fromRGB(255,180,50)),
-            ColorSequenceKeypoint.new(0.33, Color3.fromRGB(255,255,50)),
-            ColorSequenceKeypoint.new(0.5, Color3.fromRGB(50,255,50)),
-            ColorSequenceKeypoint.new(0.66, Color3.fromRGB(50,200,255)),
-            ColorSequenceKeypoint.new(0.83, Color3.fromRGB(130,50,255)),
-            ColorSequenceKeypoint.new(1, Color3.fromRGB(255,50,150)),
-        })
-        grad.Parent = label
-        table.insert(State.animGradients, {label=label, grad=grad})
-    end
 end
 
 --==================================================================
@@ -430,7 +340,6 @@ end
 --==================================================================
 local CollabsyncModel = nil
 local TeammateTemplate = nil
-local OwnerTeammateTemplate = nil
 
 local function ensureCollabsyncModel()
     local existing = ServerStorage:FindFirstChild("Collabsync model")
@@ -459,10 +368,8 @@ end
 local function findTemplates()
     if not CollabsyncModel then return end
     local t = CollabsyncModel:FindFirstChild("Teammate")
-    local o = CollabsyncModel:FindFirstChild("OwnerTeammate")
     if t then t.Archivable = true; TeammateTemplate = t end
-    if o then o.Archivable = true; OwnerTeammateTemplate = o end
-    logMsg("plugin", "info", "Templates: Teammate="..tostring(TeammateTemplate ~= nil).." Owner="..tostring(OwnerTeammateTemplate ~= nil))
+    logMsg("plugin", "info", "Template: Teammate="..tostring(TeammateTemplate ~= nil))
 end
 task.spawn(function()
     if ensureCollabsyncModel() then findTemplates() end
@@ -695,19 +602,7 @@ refreshMarkerStyle = function(uid)
     if crown then return end
     if not isLobbyHost(uid) then return end
     
-    local sourceTemplates = {}
-    if isOwner(uid) then
-        table.insert(sourceTemplates, OwnerTeammateTemplate)
-        table.insert(sourceTemplates, TeammateTemplate)
-    else
-        table.insert(sourceTemplates, TeammateTemplate)
-        table.insert(sourceTemplates, OwnerTeammateTemplate)
-    end
-    local crownSrc, sourceTemplate = nil, nil
-    for _, t in ipairs(sourceTemplates) do
-        local c = findCrownSource(t)
-        if c then crownSrc = c; sourceTemplate = t; break end
-    end
+    local crownSrc, sourceTemplate = findCrownSource(TeammateTemplate), TeammateTemplate
     if not crownSrc or not sourceTemplate then return end
     
     local newCrown = crownSrc:Clone()
@@ -736,7 +631,7 @@ createLocalMarker = function(uid, name)
     if markerLocks[uid] then return end
     markerLocks[uid] = true
     local ok, err = pcall(function()
-        if not TeammateTemplate and not OwnerTeammateTemplate then
+        if not TeammateTemplate then
             if not ensureCollabsyncModel() then
                 State.localMarkers[uid] = buildFallbackMarker(uid)
                 State.localMarkers[uid].Parent = workspace
@@ -744,10 +639,8 @@ createLocalMarker = function(uid, name)
             end
             findTemplates()
         end
-        local isOwnerUser = isOwner(uid)
-        local template = isOwnerUser and OwnerTeammateTemplate or TeammateTemplate
         local marker = nil
-        if template then
+        if TeammateTemplate then
             local cok, cloned = pcall(function() return template:Clone() end)
             if cok and cloned then marker = cloned end
         end
@@ -785,7 +678,6 @@ createLocalMarker = function(uid, name)
         marker.Parent = workspace
         State.localMarkers[uid] = marker
         computeMarkerOffsets(uid)
-        if isOwnerUser then setupMarkerRotation(marker, uid) end
         protectMarker(marker, uid)
     end)
     markerLocks[uid] = nil
@@ -1145,13 +1037,15 @@ local function buildSnapshot()
     return out
 end
 local function sendDelta(kind, data)
-    if not State.wsClient or not State.connected then return end
+    if not State.wsClient or not State.connected then return false end
+    if MY_ROLES.isTester and kind ~= "camera" then return false end
     local payload = {type="delta", id=HttpService:GenerateGUID(false), kind=kind, userId=MY_ID, userName=MY_NAME, ts=os.time()}
     for k, v in pairs(data) do payload[k] = v end
     pcall(function() State.wsClient:Send(HttpService:JSONEncode(payload)) end)
 end
 
 watchInstance = function(inst)
+    if MY_ROLES.isTester then return end
     if State.watched[inst] then return end
     if inst.Name:match("^_CS_") then return end
     if hasSkipAncestor(inst) then return end
@@ -1359,6 +1253,7 @@ applyDelta = function(delta)
 end
 
 local function startWatching()
+    if MY_ROLES.isTester then return end
     for _, svc in ipairs(SYNC_SERVICES) do
         for _, inst in ipairs(svc:GetDescendants()) do watchInstance(inst) end
         svc.DescendantAdded:Connect(function(inst)
@@ -2105,12 +2000,25 @@ connectWebSocket = function(hostUrl, token, isHost, onReady, onFail, isReconnect
         if data.type == "welcome" then
             State.connected = true; State.lastAck = tick()
             State.remotePlayers = data.players or {}
+            for _, participant in ipairs(State.remotePlayers) do
+                participant.isTester = participant.isTester == true or (participant.roles and participant.roles.isTester == true)
+                if participant.userId == MY_ID then MY_ROLES.isTester = participant.isTester end
+            end
             State.pendingChunks = {}
             State.synced = false
             pcall(refreshPlayerList)
             
-            pcall(function() client:Send(HttpService:JSONEncode({type="roles", roles=MY_ROLES})) end)
-            
+            for _, participant in ipairs(State.remotePlayers) do
+                if participant.userId == MY_ID then
+                    MY_ROLES.isTester = participant.isTester == true or (participant.roles and participant.roles.isTester == true)
+                    break
+                end
+            end
+            if MY_ROLES.isTester then
+                logMsg("lobby", "info", "Режим тестера: просмотр и Play Test, отправка изменений Place отключена")
+                if Main then showToast(Main, "Режим тестера: Place только для просмотра", T.tester) end
+            end
+
             if workspace.CurrentCamera then
                 sendDelta("camera", {cframe = {workspace.CurrentCamera.CFrame:GetComponents()}})
             end
@@ -2118,7 +2026,7 @@ connectWebSocket = function(hostUrl, token, isHost, onReady, onFail, isReconnect
             for uid in pairs(State.localMarkers) do if uid ~= MY_ID then destroyLocalMarker(uid) end end
             
             -- ФИКС: Не отправляем снапшот, если сервер его уже имеет
-            if isHost and not State.snapshotSent and (data.snapshotSize == 0 or data.snapshotSize == nil) then
+            if isHost and not MY_ROLES.isTester and not State.snapshotSent and (data.snapshotSize == 0 or data.snapshotSize == nil) then
                 State.snapshotSent = true
                 task.spawn(function()
                     local snap = buildSnapshot()
@@ -2205,6 +2113,7 @@ connectWebSocket = function(hostUrl, token, isHost, onReady, onFail, isReconnect
             local clean = {}
             for _, p in ipairs(State.remotePlayers) do
                 if not p.userId then p.userId = 0 end -- ФИКС NIL
+                p.isTester = p.isTester == true or (p.roles and p.roles.isTester == true)
                 if not seen[p.userId] then
                     seen[p.userId] = true
                     table.insert(clean, p)
@@ -2223,7 +2132,8 @@ connectWebSocket = function(hostUrl, token, isHost, onReady, onFail, isReconnect
             local active = {}
             for _, p in ipairs(State.remotePlayers) do
                 active[p.userId] = true
-                if p.roles then roleCache[p.userId] = p.roles end
+                roleCache[p.userId] = {isTester = p.isTester == true}
+                if p.userId == MY_ID then MY_ROLES.isTester = p.isTester == true end
             end
             for uid in pairs(State.localMarkers) do if not active[uid] then destroyLocalMarker(uid) end end
             if State.synced then
