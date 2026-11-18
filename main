@@ -2446,7 +2446,7 @@ connectWebSocket = function(hostUrl, token, isHost, onReady, onFail, isReconnect
             end
         elseif data.type == "lock_conflict" then
             logMsg("lobby", "warn", "Конфликт: объект редактирует "..tostring(data.userName or data.userId))
-            if InPlace then showToast(InPlace, "Объект занят: "..tostring(data.userName or "участник"), T.warning) end
+            if InPlace then showToast(InPlace, "Объект занят: "..tostring(data.userName or "участник"), T.danger) end
         elseif data.type == "heartbeat_ack" then
             State.lastAck = tick()
             
