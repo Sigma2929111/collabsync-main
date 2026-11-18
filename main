@@ -1609,11 +1609,16 @@ local function toggleRow(parent, label, yPos, initialOn, callback)
     round(tbg, 12)
     local dot = I("Frame", {Size=UDim2.fromOffset(18,18), Position=on and UDim2.fromOffset(23,3) or UDim2.fromOffset(3,3), BackgroundColor3=T.text, BorderSizePixel=0}, tbg)
     round(dot, 9)
-    I("TextButton", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text="", ZIndex=5}, tbg).MouseButton1Click:Connect(function()
-        on = not on; tbg.BackgroundColor3 = on and T.accent or T.surf3
+    local function setToggle(value)
+        on = value == true
+        tbg.BackgroundColor3 = on and T.accent or T.surf3
         dot.Position = on and UDim2.fromOffset(23,3) or UDim2.fromOffset(3,3)
+    end
+    I("TextButton", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text="", ZIndex=5}, tbg).MouseButton1Click:Connect(function()
+        setToggle(not on)
         if callback then callback(on) end
     end)
+    return setToggle
 end
 
 lbl(SGui, "Настройки интерфейса", {font=Enum.Font.GothamBold, textSize=16, size=UDim2.new(1,0,0,24)})
@@ -1796,7 +1801,7 @@ end
 lbl(SBackups, "Резервные копии рабочего пространства", {font=Enum.Font.GothamBold, textSize=16, size=UDim2.new(1,0,0,24)})
 lbl(SBackups, "Автоматические копии выключены по умолчанию. Расписание: раз в 24 часа, хранение: 20 копий.", {textSize=12, color=T.muted, size=UDim2.new(1,0,0,34), pos=UDim2.fromOffset(0,28)})
 local backupStatus = lbl(SBackups, "Статус: настройки не загружены", {textSize=12, color=T.muted, size=UDim2.new(1,0,0,22), pos=UDim2.fromOffset(0,66)})
-local backupList = I("Frame", {Size=UDim2.new(1,0,1,-180), Position=UDim2.fromOffset(0,104), BackgroundColor3=T.surface, BorderSizePixel=0}, SBackups)
+local backupList = I("Frame", {Size=UDim2.new(1,0,1,-260), Position=UDim2.fromOffset(0,240), BackgroundColor3=T.surface, BorderSizePixel=0}, SBackups)
 round(backupList, 10); outline(backupList, T.border, 1); pad(backupList, 8)
 I("UIListLayout", {Padding=UDim.new(0,6)}, backupList)
 local function backupRequest(path, method, body)
@@ -1804,11 +1809,13 @@ local function backupRequest(path, method, body)
     local base = tostring(State.session.hostUrl or ""):gsub("/+$", "")
     return httpJson(base .. path, method, body, {["Content-Type"]="application/json", ["Authorization"]="Bearer "..tostring(State.session.token or "")})
 end
+local backupToggleSet
 local function refreshBackups()
     if not State.session or not currentLobby or not isOwnLobby then backupStatus.Text = "Доступно только владельцу активного лобби"; return end
     local ok, data = backupRequest("/api/workspace/"..tostring(currentLobby.id).."/backups", "GET")
     if not ok then backupStatus.Text = "Ошибка загрузки: "..tostring(data and data.error or data); return end
     local settings = data.settings or {}
+    if backupToggleSet then backupToggleSet(settings.enabled == true) end
     backupStatus.Text = "Автокопии: "..(settings.enabled and "ВКЛ" or "ВЫКЛ").." | копий: "..tostring(#(data.backups or {}))
     for _, child in ipairs(backupList:GetChildren()) do if child:IsA("Frame") then child:Destroy() end end
     for _, backup in ipairs(data.backups or {}) do
@@ -1823,7 +1830,7 @@ local function refreshBackups()
         end)
     end
 end
-local backupEnable = toggleRow(SBackups, "Автоматически создавать копии", 142, false, function(enabled)
+backupToggleSet = toggleRow(SBackups, "Автоматически создавать копии", 142, false, function(enabled)
     local ok, data = backupRequest("/api/workspace/backups/settings", "POST", {lobbyId=currentLobby.id, enabled=enabled, intervalMs=86400000, retention=20})
     if ok then backupStatus.Text = "Автокопии: "..(enabled and "ВКЛ" or "ВЫКЛ").." · 24 часа · 20 копий" else showToast(S, "Не удалось сохранить настройки", T.danger) end
 end)
