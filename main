@@ -1053,6 +1053,7 @@ watchInstance = function(inst)
     State.watched[inst] = true
     getOrSetId(inst)
     local function scheduleUpdate(prop)
+        if MY_ROLES.isTester then return end
         if State.applyingRemote[inst] then return end
         if prop == "_CS_Id" or prop == "_CS_ParentId" then return end
         if State.partThrottle[inst] then return end
@@ -1257,6 +1258,7 @@ local function startWatching()
     for _, svc in ipairs(SYNC_SERVICES) do
         for _, inst in ipairs(svc:GetDescendants()) do watchInstance(inst) end
         svc.DescendantAdded:Connect(function(inst)
+            if MY_ROLES.isTester then return end
             if inst.Name:match("^_CS_") then return end
             if hasSkipAncestor(inst) then return end
             if shouldSkip(inst) then return end
@@ -1270,6 +1272,7 @@ local function startWatching()
             end
         end)
         svc.DescendantRemoving:Connect(function(inst)
+            if MY_ROLES.isTester then return end
             if inst.Name:match("^_CS_") then return end
             if hasSkipAncestor(inst) then return end
             if State.applyingSnapshot then return end
