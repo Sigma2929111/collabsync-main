@@ -11,7 +11,8 @@
     "start:catalog": "node \"server 1\"",
     "start:host": "node \"server 2\"",
     "start:combined": "node \"server 2 in 1\"",
-    "check": "node --check \"server 1\" && node --check \"server 2\" && node --check \"server 2 in 1\""
+    "check": "node --check \"server 1\" && node --check \"server 2\" && node --check \"server 2 in 1\"",
+    "test": "node --test"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
