@@ -89,7 +89,7 @@ app.post("/api/lobby/create", async (req, res) => {
         });
 
         const token = jwt.sign(
-            { lobbyId, userId: Number(hostId), userName: hostName || String(hostId), isHost: true, isTester: false, lobbyName: name },
+            { lobbyId, userId: hostUid, userName: String(hostName || hostUid).slice(0, 32), isHost: true, isTester: false, lobbyName: String(name) },
             JWT_SECRET, { expiresIn: "12h" }
         );
         res.json({ lobbyId, token, hostUrl });
@@ -320,14 +320,6 @@ wss.on("connection", (ws) => {
                 if (info.userId === myUserId) {
                     try { oldWs.close(); } catch(e) {}
                     room.clients.delete(oldWs);
-                }
-            }
-
-            // ФИКС "НЕСКОЛЬКО МЕНЯ" (Убиваем зависшие сокеты этого же пользователя)
-            for (const [existingWs, info] of room.clients.entries()) {
-                if (info.userId === myUserId) {
-                    try { existingWs.close(); } catch(e){}
-                    room.clients.delete(existingWs);
                 }
             }
 
