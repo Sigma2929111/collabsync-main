@@ -1801,6 +1801,7 @@ end
 lbl(SBackups, "Резервные копии рабочего пространства", {font=Enum.Font.GothamBold, textSize=16, size=UDim2.new(1,0,0,24)})
 lbl(SBackups, "Автоматические копии выключены по умолчанию. Расписание: раз в 24 часа, хранение: 20 копий.", {textSize=12, color=T.muted, size=UDim2.new(1,0,0,34), pos=UDim2.fromOffset(0,28)})
 local backupStatus = lbl(SBackups, "Статус: настройки не загружены", {textSize=12, color=T.muted, size=UDim2.new(1,0,0,22), pos=UDim2.fromOffset(0,66)})
+local activityStatus = lbl(SBackups, "Последние изменения: ещё не загружены", {textSize=11, color=T.muted, size=UDim2.new(1,0,0,54), pos=UDim2.fromOffset(0,92)})
 local backupList = I("Frame", {Size=UDim2.new(1,0,1,-260), Position=UDim2.fromOffset(0,240), BackgroundColor3=T.surface, BorderSizePixel=0}, SBackups)
 round(backupList, 10); outline(backupList, T.border, 1); pad(backupList, 8)
 I("UIListLayout", {Padding=UDim.new(0,6)}, backupList)
@@ -1817,6 +1818,19 @@ local function refreshBackups()
     local settings = data.settings or {}
     if backupToggleSet then backupToggleSet(settings.enabled == true) end
     backupStatus.Text = "Автокопии: "..(settings.enabled and "ВКЛ" or "ВЫКЛ").." | копий: "..tostring(#(data.backups or {}))
+    local aok, activityData = backupRequest("/api/workspace/"..tostring(currentLobby.id).."/activity", "GET")
+    if aok then
+        local lines = {}
+        for _, item in ipairs(activityData.activity or {}) do
+            local stamp = os.date("%d.%m %H:%M", math.floor((tonumber(item.ts) or 0)/1000))
+            table.insert(lines, tostring(item.userName or item.userId).." · "..tostring(item.kind).." · "..stamp)
+        end
+        local recent = {}
+        for i = math.max(1, #lines - 2), #lines do table.insert(recent, lines[i]) end
+        activityStatus.Text = #recent > 0 and ("Последние изменения: "..table.concat(recent, " | ")) or "Последние изменения: нет"
+    else
+        activityStatus.Text = "История активности недоступна"
+    end
     for _, child in ipairs(backupList:GetChildren()) do if child:IsA("Frame") then child:Destroy() end end
     for _, backup in ipairs(data.backups or {}) do
         local row = I("Frame", {Size=UDim2.new(1,-4,0,38), BackgroundColor3=T.surf2, BorderSizePixel=0}, backupList)
