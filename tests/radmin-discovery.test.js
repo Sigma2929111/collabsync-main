@@ -206,3 +206,127 @@ test("Server 1 and Server 2 support a real two-client collaboration session", as
         fs.rmSync(dataDir, { recursive:true, force:true });
     }
 });
+
+
+async function stopNodeServer(child) {
+    if (!child || child.exitCode !== null) return;
+    child.kill("SIGTERM");
+    await Promise.race([
+        new Promise(resolve => child.once("exit", resolve)),
+        new Promise(resolve => setTimeout(resolve, 8000)),
+    ]);
+    if (child.exitCode === null) throw new Error("server did not shut down gracefully");
+}
+
+async function connectWs(url, token) {
+    const socket = new WebSocket(url.replace(/^http:/, "ws:") + "/ws");
+    const welcomePromise = waitForMessage(socket, message => message.type === "welcome");
+    await new Promise((resolve, reject) => {
+        socket.once("error", reject);
+        socket.once("open", resolve);
+    });
+    socket.send(JSON.stringify({type:"hello", token}));
+    return {socket, welcome: await welcomePromise};
+}
+
+test("persistent workspace backup, restore, restart and owner rejoin work end-to-end", async () => {
+    const port = await freePort();
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "collabsync-persistent-test-"));
+    let child, hostSocket, guestSocket;
+    const base = "http://127.0.0.1:" + port;
+    try {
+        child = await startNodeServer("server 2 in 1", port, dataDir);
+        const createdResponse = await fetch(base + "/api/lobby/create", {
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({
+                name:"CI persistent workspace",
+                hostId:130001,
+                hostName:"CI Owner",
+                persistent:true,
+                placeId:1,
+                placeName:"Persistent CI Place",
+            }),
+        });
+        assert.equal(createdResponse.status, 200);
+        const created = await createdResponse.json();
+        assert.equal(created.persistent, true);
+
+        const hostConnection = await connectWs(base, created.token);
+        hostSocket = hostConnection.socket;
+        const firstSnapshot = [{
+            id:"ci-object-1", parentId:"service:Workspace", className:"Part",
+            name:"Before backup", props:{Name:"Before backup"}, attrs:{},
+        }];
+        hostSocket.send(JSON.stringify({type:"snapshot", data:firstSnapshot}));
+        await new Promise(resolve => setTimeout(resolve, 400));
+
+        const backupResponse = await fetch(base + "/api/workspace/backups/create", {
+            method:"POST",
+            headers:{"Content-Type":"application/json", "Authorization":"Bearer "+created.token},
+            body:JSON.stringify({lobbyId:created.lobbyId}),
+        });
+        assert.equal(backupResponse.status, 200);
+        const backupData = await backupResponse.json();
+        assert.ok(backupData.backup && backupData.backup.id);
+
+        hostSocket.send(JSON.stringify({type:"snapshot", data:[
+            ...firstSnapshot,
+            {id:"ci-object-2", parentId:"service:Workspace", className:"Part", name:"After backup", props:{Name:"After backup"}, attrs:{}},
+        ]}));
+        await new Promise(resolve => setTimeout(resolve, 350));
+
+        const restoreResponse = await fetch(base + "/api/workspace/backups/restore", {
+            method:"POST",
+            headers:{"Content-Type":"application/json", "Authorization":"Bearer "+created.token},
+            body:JSON.stringify({lobbyId:created.lobbyId, backupId:backupData.backup.id}),
+        });
+        assert.equal(restoreResponse.status, 200);
+        const restored = await restoreResponse.json();
+        assert.equal(restored.snapshotSize, 1);
+
+        await hostSocket.close();
+        hostSocket = null;
+        await stopNodeServer(child);
+        child = null;
+
+        child = await startNodeServer("server 2 in 1", port, dataDir);
+        const listResponse = await fetch(base + "/api/lobby/list");
+        assert.equal(listResponse.status, 200);
+        const listData = await listResponse.json();
+        assert.ok(listData.lobbies.some(lobby => lobby.id === created.lobbyId));
+
+        const ownerJoinResponse = await fetch(base + "/api/lobby/join", {
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({lobbyId:created.lobbyId, userId:130001, userName:"CI Owner"}),
+        });
+        assert.equal(ownerJoinResponse.status, 200);
+        const ownerJoin = await ownerJoinResponse.json();
+        assert.equal(ownerJoin.isHost, true);
+        assert.equal(ownerJoin.persistent, true);
+
+        const guestJoinResponse = await fetch(base + "/api/lobby/join", {
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({lobbyId:created.lobbyId, userId:130002, userName:"CI Guest"}),
+        });
+        assert.equal(guestJoinResponse.status, 200);
+        const guestJoin = await guestJoinResponse.json();
+        assert.equal(guestJoin.isHost, false);
+
+        const guestConnection = await connectWs(base, guestJoin.token);
+        guestSocket = guestConnection.socket;
+        assert.equal(guestConnection.welcome.lobbyId, created.lobbyId);
+
+        const ownerConnection = await connectWs(base, ownerJoin.token);
+        hostSocket = ownerConnection.socket;
+        assert.equal(ownerConnection.welcome.snapshotSize, 1);
+    } finally {
+        for (const socket of [hostSocket, guestSocket]) {
+            if (socket && socket.readyState !== WebSocket.CLOSED) socket.close();
+        }
+        await stopNodeServer(child);
+        fs.rmSync(dataDir, {recursive:true, force:true});
+    }
+});
