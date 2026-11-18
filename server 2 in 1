@@ -592,6 +592,14 @@ wss.on("connection", (ws) => {
         if (msg.type === "leave") {
             const wasHost = clientInfo && clientInfo.isHost;
             room.clients.delete(ws);
+        if (info && room.locks) {
+            for (const [objectId, lock] of room.locks.entries()) {
+                if (lock.userId === info.userId) {
+                    room.locks.delete(objectId);
+                    broadcast(room, {type:"lock_state", objectId, lock:null});
+                }
+            }
+        }
             if (wasHost && lobbies.get(lobbyId)?.persistent) broadcast(room, { type: "host_left" });
             if (wasHost && !lobbies.get(lobbyId)?.persistent) {
                 broadcast(room, { type: "host_left" });
