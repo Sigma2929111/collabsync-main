@@ -91,11 +91,11 @@ test("Server 2-in-1 exposes loopback-only Radmin discovery", async () => {
 });
 
 
-function waitForMessage(socket, predicate, timeoutMs = 4000) {
+function waitForMessage(socket, predicate, timeoutMs = 4000, label = "matching message") {
     return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
             socket.off("message", onMessage);
-            reject(new Error("WebSocket message timeout"));
+            reject(new Error("WebSocket message timeout: " + label));
         }, timeoutMs);
         function onMessage(raw) {
             let message;
@@ -199,7 +199,7 @@ test("Server 1 and Server 2 support a real two-client collaboration session", as
 
         const denyUpdate = waitForMessage(guestSocket, message =>
             message.type === "players" && message.players.some(p => p.userId === 120002 && p.permissions && p.permissions.edit === false)
-        );
+        , 4000, "guest permission deny broadcast");
         hostSocket.send(JSON.stringify({
             type:"permissions_update", targetUserId:120002,
             permissions:{edit:false, delete:false, move:false, add:false},
@@ -212,7 +212,7 @@ test("Server 1 and Server 2 support a real two-client collaboration session", as
 
         const allowUpdate = waitForMessage(guestSocket, message =>
             message.type === "players" && message.players.some(p => p.userId === 120002 && p.permissions && p.permissions.edit === true)
-        );
+        , 4000, "guest permission allow broadcast");
         hostSocket.send(JSON.stringify({
             type:"permissions_update", targetUserId:120002,
             permissions:{edit:true, delete:false, move:false, add:false},
