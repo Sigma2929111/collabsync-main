@@ -54,7 +54,7 @@ const rooms = new Map();
 
 function getRoom(lobbyId) {
     if (!rooms.has(lobbyId)) {
-        rooms.set(lobbyId, { clients: new Map(), snapshot: [], history: [], hostUserId: null, lastHostPing: Date.now(), persistent: false, permissions: {}, backupSettings: {enabled:false, intervalMs:86400000, retention:20, lastBackupAt:0}, backups: [], activity: [] });
+        rooms.set(lobbyId, { clients: new Map(), snapshot: [], history: [], hostUserId: null, lastHostPing: Date.now(), persistent: false, permissions: {}, locks: new Map(), backupSettings: {enabled:false, intervalMs:86400000, retention:20, lastBackupAt:0}, backups: [], activity: [] });
     }
     return rooms.get(lobbyId);
 }
@@ -333,6 +333,13 @@ wss.on("connection", (ws) => {
             if (!clientInfo.isHost && !canApplyDelta(clientInfo.permissions, msg)) return;
             if (typeof msg.id !== "string" || msg.id.length > 128) return;
             if (msg.kind !== "camera" && (typeof msg.id !== "string" || !msg.id)) return;
+            const lockId = String(msg.id || "");
+            const objectLock = room.locks?.get(lockId);
+            if (objectLock && objectLock.expiresAt > Date.now() && objectLock.userId !== clientInfo.userId) {
+                try { ws.send(JSON.stringify({type:"lock_conflict", objectId:lockId, userId:objectLock.userId, userName:objectLock.userName, expiresAt:objectLock.expiresAt})); } catch (_) {}
+                return;
+            }
+            if (objectLock && objectLock.expiresAt <= Date.now()) room.locks.delete(lockId);
             if (msg.kind === "camera" && (!Array.isArray(msg.cframe) || msg.cframe.length !== 12 || !msg.cframe.every(Number.isFinite))) return;
             if ((msg.kind === "create" || msg.kind === "update") && (!msg.props || typeof msg.props !== "object" || Array.isArray(msg.props))) return;
             if (msg.kind === "create" && (typeof msg.className !== "string" || typeof msg.name !== "string" || typeof msg.parentId !== "string")) return;
@@ -362,6 +369,30 @@ wss.on("connection", (ws) => {
             return;
         }
 
+        if (msg.type === "lock_request") {
+            if (!clientInfo || clientInfo.isTester || typeof msg.objectId !== "string" || !msg.objectId || msg.objectId.length > 128) return;
+            if (!room.locks) room.locks = new Map();
+            const objectId = msg.objectId;
+            const current = room.locks.get(objectId);
+            const currentTime = Date.now();
+            if (current && current.expiresAt > currentTime && current.userId !== clientInfo.userId) {
+                try { ws.send(JSON.stringify({type:"lock_conflict", objectId, userId:current.userId, userName:current.userName, expiresAt:current.expiresAt})); } catch (_) {}
+                return;
+            }
+            const lock = {userId:clientInfo.userId, userName:clientInfo.userName, expiresAt:currentTime + 90000};
+            room.locks.set(objectId, lock);
+            broadcast(room, {type:"lock_state", objectId, lock});
+            return;
+        }
+        if (msg.type === "lock_release") {
+            if (!clientInfo || typeof msg.objectId !== "string") return;
+            const lock = room.locks?.get(msg.objectId);
+            if (lock && (lock.userId === clientInfo.userId || clientInfo.isHost)) {
+                room.locks.delete(msg.objectId);
+                broadcast(room, {type:"lock_state", objectId:msg.objectId, lock:null});
+            }
+            return;
+        }
         if (msg.type === "heartbeat") {
             if (!clientInfo) return;
             if (clientInfo.isHost) room.lastHostPing = Date.now();
