@@ -410,7 +410,12 @@ test("split Server 1 + Server 2 persistent workspace survives both service resta
         hostSocket = ownerConnection.socket;
         assert.equal(ownerConnection.welcome.snapshotSize, 1);
     } finally {
-        if (hostSocket && hostSocket.readyState !== WebSocket.CLOSED) hostSocket.close();
+        if (hostSocket && hostSocket.readyState !== WebSocket.CLOSED) {
+            await new Promise(resolve => {
+                hostSocket.once("close", resolve);
+                hostSocket.close();
+            });
+        }
         await stopNodeServer(host);
         await stopNodeServer(catalog);
         fs.rmSync(dataDir, {recursive:true, force:true});
