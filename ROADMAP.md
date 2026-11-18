@@ -12,7 +12,7 @@
 - Долгосрочные лобби, snapshot/history, backup и activity с атомарным файловым сохранением в 2-in-1 и split Server 1 + Server 2.
 - Автоматическое обнаружение Radmin IPv4 и каталог Radmin-лобби без ручного ввода IP/JWT; системный Firewall остаётся задачей администратора.
 - Интеграционные Node.js тесты двух клиентов, ACL, locks, persistent restart, backups и Radmin endpoint.
-- CI workflow проверяет синтаксис Node.js и запускает тесты; Luau/Roblox Studio runtime в CI не исполняется.
+- CI workflow проверяет синтаксис Node.js, запускает интеграционные тесты и статические contract-проверки критических участков плагина; Luau/Roblox Studio runtime в CI не исполняется.
 
 ## P0 — надёжность и защита
 
