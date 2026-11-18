@@ -382,6 +382,14 @@ wss.on("connection", (ws) => {
             const permissions = normalizePermissions(msg.permissions);
             room.permissions[targetUserId] = permissions;
             for (const info of room.clients.values()) if (info.userId === targetUserId) info.permissions = permissions;
+            if (!permissions.edit && !permissions.delete && !permissions.move && !permissions.add && room.locks) {
+                for (const [objectId, lock] of room.locks.entries()) {
+                    if (lock.userId === targetUserId) {
+                        room.locks.delete(objectId);
+                        broadcast(room, {type:"lock_state", objectId, lock:null});
+                    }
+                }
+            }
             if (room.persistent) schedulePersist();
             sendPlayers(room);
             return;
