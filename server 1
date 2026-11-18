@@ -14,7 +14,6 @@ const HEARTBEAT_TIMEOUT_MS = 45000;
 
 // Тестеры получают режим просмотра; специальные декоративные роли удалены.
 const TESTER_IDS = new Set((process.env.TESTER_IDS || "").split(",").map(s=>s.trim()).filter(Boolean));
-const TESTER_NAMES = new Set((process.env.TESTER_NAMES || "").split(",").map(s=>s.trim()).filter(Boolean));
 
 const lobbies = new Map();
 const bannedUsers = new Set();
@@ -26,7 +25,7 @@ function getUserRoles(userId, userName) {
     const idStr = String(userId || "");
     const name = String(userName || "");
     return {
-        isTester: TESTER_IDS.has(idStr) || TESTER_NAMES.has(name),
+        isTester: TESTER_IDS.has(idStr),
         isBanned: bannedUsers.has(idStr) || bannedUsers.has(name),
     };
 }
