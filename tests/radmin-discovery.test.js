@@ -414,6 +414,13 @@ test("split Server 1 + Server 2 persistent workspace survives both service resta
         hostSocket = firstConnection.socket;
         const snapshot = [{id:"split-object", parentId:"service:Workspace", className:"Part", name:"Persisted", props:{Name:"Persisted"}, attrs:{}}];
         hostSocket.send(JSON.stringify({type:"snapshot", data:snapshot}));
+        const backupHeaders = {"Content-Type":"application/json", "Authorization":"Bearer "+created.token};
+        const backupCreateBeforeRestart = await fetch(hostUrl + "/api/workspace/backups/create", {
+            method:"POST", headers:backupHeaders, body:JSON.stringify({lobbyId:created.lobbyId}),
+        });
+        assert.equal(backupCreateBeforeRestart.status, 200);
+        const persistedBackup = await backupCreateBeforeRestart.json();
+        hostSocket.send(JSON.stringify({type:"delta", id:"split-history-event", objectId:"split-object", kind:"update", props:{Name:"Changed before restart"}}));
         await new Promise(resolve => setTimeout(resolve, 450));
         await new Promise(resolve => { hostSocket.once("close", resolve); hostSocket.close(); });
         hostSocket = null;
@@ -443,19 +450,15 @@ test("split Server 1 + Server 2 persistent workspace survives both service resta
         const ownerConnection = await connectWs(hostUrl, ownerJoin.token);
         hostSocket = ownerConnection.socket;
         assert.equal(ownerConnection.welcome.snapshotSize, 1);
-        const backupHeaders = {"Content-Type":"application/json", "Authorization":"Bearer "+ownerJoin.token};
-        const backupCreateResponse = await fetch(hostUrl + "/api/workspace/backups/create", {
-            method:"POST", headers:backupHeaders, body:JSON.stringify({lobbyId:created.lobbyId}),
-        });
-        assert.equal(backupCreateResponse.status, 200);
-        const splitBackup = await backupCreateResponse.json();
-        assert.ok(splitBackup.backup && splitBackup.backup.id);
-        const backupListResponse = await fetch(hostUrl + "/api/workspace/"+created.lobbyId+"/backups", {headers:backupHeaders});
+        const backupHeadersAfterRestart = {"Content-Type":"application/json", "Authorization":"Bearer "+ownerJoin.token};
+        const backupListResponse = await fetch(hostUrl + "/api/workspace/"+created.lobbyId+"/backups", {headers:backupHeadersAfterRestart});
         assert.equal(backupListResponse.status, 200);
         const splitBackupList = await backupListResponse.json();
-        assert.ok(splitBackupList.backups.some(item => item.id === splitBackup.backup.id));
-        const activityResponse = await fetch(hostUrl + "/api/workspace/"+created.lobbyId+"/activity", {headers:backupHeaders});
+        assert.ok(splitBackupList.backups.some(item => item.id === persistedBackup.backup.id), "backup must survive Server 2 restart");
+        const activityResponse = await fetch(hostUrl + "/api/workspace/"+created.lobbyId+"/activity", {headers:backupHeadersAfterRestart});
         assert.equal(activityResponse.status, 200);
+        const splitActivity = await activityResponse.json();
+        assert.ok(splitActivity.activity.some(item => item.id === "split-history-event"), "activity log must survive Server 2 restart");
     } finally {
         if (hostSocket && hostSocket.readyState !== WebSocket.CLOSED) {
             await new Promise(resolve => {
