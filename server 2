@@ -1,6 +1,7 @@
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { detectRadminIPv4, isLoopbackRequest } = require("./radmin-network");
 const { WebSocketServer } = require("ws");
 const jwt = require("jsonwebtoken");
@@ -19,7 +20,7 @@ const STATE_FILE = path.join(DATA_DIR, "server2-state.json");
 let persistTimer = null, persistQueue = Promise.resolve();
 async function flushPersistentRooms() {
     if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
-    const state = { version: 1, rooms: [...rooms.entries()].filter(([, r]) => r.persistent).map(([id, r]) => [id, { snapshot: r.snapshot, history: r.history.slice(-MAX_HISTORY), hostUserId: r.hostUserId, lastHostPing: r.lastHostPing, permissions: r.permissions }]) };
+    const state = { version: 1, rooms: [...rooms.entries()].filter(([, r]) => r.persistent).map(([id, r]) => [id, { snapshot: r.snapshot, history: r.history.slice(-MAX_HISTORY), hostUserId: r.hostUserId, lastHostPing: r.lastHostPing, permissions: r.permissions, backupSettings: r.backupSettings, backups: r.backups, activity: r.activity }]) };
     const data = JSON.stringify(state);
     persistQueue = persistQueue.catch(() => {}).then(async () => {
         await fs.promises.mkdir(DATA_DIR, { recursive: true });
@@ -39,7 +40,7 @@ async function restorePersistentRooms() {
         if (state.version !== 1 || !Array.isArray(state.rooms)) throw new Error("unsupported Server 2 state format");
         for (const [id, saved] of state.rooms) {
             if (typeof id !== "string" || !saved || !Array.isArray(saved.snapshot) || !Array.isArray(saved.history)) continue;
-            rooms.set(id, { clients: new Map(), snapshot: saved.snapshot, history: saved.history.slice(-MAX_HISTORY), hostUserId: Number(saved.hostUserId) || null, lastHostPing: Number(saved.lastHostPing) || Date.now(), persistent: true, permissions: saved.permissions && typeof saved.permissions === "object" ? saved.permissions : {} });
+            rooms.set(id, { clients: new Map(), snapshot: saved.snapshot, history: saved.history.slice(-MAX_HISTORY), hostUserId: Number(saved.hostUserId) || null, lastHostPing: Number(saved.lastHostPing) || Date.now(), persistent: true, permissions: saved.permissions && typeof saved.permissions === "object" ? saved.permissions : {}, backupSettings: saved.backupSettings || {enabled:false, intervalMs:86400000, retention:20, lastBackupAt:0}, backups: Array.isArray(saved.backups) ? saved.backups : [], activity: Array.isArray(saved.activity) ? saved.activity.slice(-500) : [] });
         }
         console.log(`[Persistence] restored ${rooms.size} persistent Server 2 rooms`);
     } catch (e) { if (e.code !== "ENOENT") console.error("[Persistence] Server 2 restore failed:", e.message); }
@@ -53,12 +54,98 @@ const rooms = new Map();
 
 function getRoom(lobbyId) {
     if (!rooms.has(lobbyId)) {
-        rooms.set(lobbyId, { clients: new Map(), snapshot: [], history: [], hostUserId: null, lastHostPing: Date.now(), persistent: false, permissions: {} });
+        rooms.set(lobbyId, { clients: new Map(), snapshot: [], history: [], hostUserId: null, lastHostPing: Date.now(), persistent: false, permissions: {}, backupSettings: {enabled:false, intervalMs:86400000, retention:20, lastBackupAt:0}, backups: [], activity: [] });
     }
     return rooms.get(lobbyId);
 }
 
-const server = http.createServer((req, res) => {
+async function readJsonBody(req) {
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of req) {
+        size += chunk.length;
+        if (size > 1024 * 1024) throw new Error("request body too large");
+        chunks.push(chunk);
+    }
+    if (!chunks.length) return {};
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+function sendJson(res, status, value) {
+    res.writeHead(status, {"Content-Type":"application/json", "Cache-Control":"no-store"});
+    res.end(JSON.stringify(value));
+}
+function getAuthorizedWorkspace(req, res, lobbyId) {
+    const auth = String(req.headers.authorization || "");
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    let claims;
+    try { claims = jwt.verify(token, JWT_SECRET); }
+    catch (_) { sendJson(res, 401, {error:"unauthorized"}); return null; }
+    const room = rooms.get(lobbyId);
+    if (!room) { sendJson(res, 404, {error:"workspace not found"}); return null; }
+    if (!claims.isHost || claims.lobbyId !== lobbyId || Number(claims.userId) !== Number(room.hostUserId)) {
+        sendJson(res, 403, {error:"owner required"}); return null;
+    }
+    if (!room.persistent) { sendJson(res, 409, {error:"persistent workspace required"}); return null; }
+    return room;
+}
+async function handleWorkspaceApi(req, res, url) {
+    const backupList = url.pathname.match(/^\/api\/workspace\/([^/]+)\/backups$/);
+    const activityList = url.pathname.match(/^\/api\/workspace\/([^/]+)\/activity$/);
+    if (req.method === "GET" && backupList) {
+        const lobbyId = decodeURIComponent(backupList[1]);
+        const room = getAuthorizedWorkspace(req, res, lobbyId); if (!room) return true;
+        sendJson(res, 200, {settings:room.backupSettings, backups:room.backups.map(({id,createdAt,reason,snapshotSize})=>({id,createdAt,reason,snapshotSize}))});
+        return true;
+    }
+    if (req.method === "GET" && activityList) {
+        const lobbyId = decodeURIComponent(activityList[1]);
+        const room = getAuthorizedWorkspace(req, res, lobbyId); if (!room) return true;
+        sendJson(res, 200, {activity:room.activity.slice(-50)}); return true;
+    }
+    if (req.method !== "POST" || !["/api/workspace/backups/settings","/api/workspace/backups/create","/api/workspace/backups/restore"].includes(url.pathname)) return false;
+    let body;
+    try { body = await readJsonBody(req); }
+    catch (e) { sendJson(res, 400, {error:e.message === "request body too large" ? e.message : "invalid JSON"}); return true; }
+    const lobbyId = String(body.lobbyId || "");
+    const room = getAuthorizedWorkspace(req, res, lobbyId); if (!room) return true;
+    if (url.pathname.endsWith("/settings")) {
+        const intervalMs = Number(body.intervalMs || 86400000), retention = Number(body.retention || 20);
+        if (!Number.isSafeInteger(intervalMs) || intervalMs < 3600000 || intervalMs > 2592000000 || !Number.isInteger(retention) || retention < 1 || retention > 100) {
+            sendJson(res, 400, {error:"invalid backup settings"}); return true;
+        }
+        room.backupSettings = {enabled:body.enabled === true, intervalMs, retention, lastBackupAt:room.backupSettings?.lastBackupAt || 0};
+        room.backups = room.backups.slice(-retention);
+        schedulePersist(); sendJson(res, 200, {ok:true, settings:room.backupSettings}); return true;
+    }
+    if (url.pathname.endsWith("/create")) {
+        if (!room.snapshot.length) { sendJson(res, 409, {error:"no snapshot available"}); return true; }
+        const backup = {id:crypto.randomUUID(), createdAt:Date.now(), reason:"manual", snapshot:room.snapshot, history:room.history.slice(-MAX_HISTORY), snapshotSize:room.snapshot.length};
+        room.backups = [...room.backups, backup].slice(-room.backupSettings.retention);
+        room.backupSettings.lastBackupAt = Date.now();
+        schedulePersist();
+        sendJson(res, 200, {ok:true, backup:{id:backup.id,createdAt:backup.createdAt,snapshotSize:backup.snapshotSize}}); return true;
+    }
+    if (url.pathname.endsWith("/restore")) {
+        const backup = room.backups.find(item => item.id === body.backupId);
+        if (!backup) { sendJson(res, 404, {error:"backup not found"}); return true; }
+        if (room.snapshot.length) {
+            const safety = {id:crypto.randomUUID(),createdAt:Date.now(),reason:"pre-restore",snapshot:room.snapshot,history:room.history,snapshotSize:room.snapshot.length};
+            room.backups = [...room.backups,safety].slice(-room.backupSettings.retention);
+        }
+        room.snapshot = backup.snapshot;
+        room.history = Array.isArray(backup.history) ? backup.history : [];
+        schedulePersist();
+        sendJson(res, 200, {ok:true,restoredBackupId:backup.id,snapshotSize:room.snapshot.length,note:"Reconnect the Studio plugin to load the restored snapshot."}); return true;
+    }
+    return false;
+}
+
+const server = http.createServer(async (req, res) => {
+    const requestUrl = new URL(req.url, "http://localhost");
+    if (requestUrl.pathname.startsWith("/api/workspace/")) {
+        try { if (await handleWorkspaceApi(req, res, requestUrl)) return; }
+        catch (e) { console.error("[Workspace API]", e.message); if (!res.headersSent) sendJson(res, 500, {error:"internal server error"}); return; }
+    }
     if (req.url === "/health") {
         res.writeHead(200, {"Content-Type":"application/json"});
         res.end(JSON.stringify({ok:true, rooms:rooms.size, ts:Date.now()}));
