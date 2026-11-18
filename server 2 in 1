@@ -32,20 +32,25 @@ const rooms = new Map();
 const DATA_DIR = process.env.COLLABSYNC_DATA_DIR || path.join(__dirname, ".collabsync-data");
 const STATE_FILE = path.join(DATA_DIR, "state.json");
 let persistTimer = null, persistQueue = Promise.resolve();
+async function flushPersistentState() {
+    if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+    const keep = [...lobbies.values()].filter(l => l.persistent);
+    const ids = new Set(keep.map(l => l.id));
+    const state = { version: 1, lobbies: keep, rooms: [...rooms.entries()].filter(([id]) => ids.has(id)).map(([id, r]) => [id, { snapshot: r.snapshot, history: r.history, hostUserId: r.hostUserId, lastHostPing: r.lastHostPing }]) };
+    const data = JSON.stringify(state);
+    persistQueue = persistQueue.then(async () => {
+        await fs.promises.mkdir(DATA_DIR, { recursive: true });
+        const tmp = STATE_FILE + ".tmp";
+        await fs.promises.writeFile(tmp, data, { mode: 0o600 });
+        await fs.promises.rename(tmp, STATE_FILE);
+    });
+    await persistQueue;
+}
 function schedulePersist() {
     if (persistTimer) clearTimeout(persistTimer);
     persistTimer = setTimeout(() => {
         persistTimer = null;
-        const keep = [...lobbies.values()].filter(l => l.persistent);
-        const ids = new Set(keep.map(l => l.id));
-        const state = { version: 1, lobbies: keep, rooms: [...rooms.entries()].filter(([id]) => ids.has(id)).map(([id, r]) => [id, { snapshot: r.snapshot, history: r.history, hostUserId: r.hostUserId, lastHostPing: r.lastHostPing }]) };
-        const data = JSON.stringify(state);
-        persistQueue = persistQueue.then(async () => {
-            await fs.promises.mkdir(DATA_DIR, { recursive: true });
-            const tmp = STATE_FILE + ".tmp";
-            await fs.promises.writeFile(tmp, data, { mode: 0o600 });
-            await fs.promises.rename(tmp, STATE_FILE);
-        }).catch(e => console.error("[Persistence] save failed:", e.message));
+        flushPersistentState().catch(e => console.error("[Persistence] save failed:", e.message));
     }, 250);
 }
 async function restorePersistentState() {
@@ -418,18 +423,20 @@ wss.on("connection", (ws) => {
             }
 
             const persistentLobby = lobbies.get(lobbyId)?.persistent === true;
-            if (!myIsHost && !persistentLobby) {
-                if (!room.hostUserId) {
-                    try { ws.send(JSON.stringify({ type: "error", message: "waiting for host" })); } catch(e){}
-                    ws.close(); return;
-                }
-                let hostOnline = false;
-                for (const [, info] of room.clients) {
-                    if (info.userId === room.hostUserId && info.isHost) { hostOnline = true; break; }
-                }
-                if (!hostOnline) {
-                    try { ws.send(JSON.stringify({ type: "error", message: "host offline" })); } catch(e){}
-                    ws.close(); return;
+            if (!myIsHost) {
+                if (!persistentLobby) {
+                    if (!room.hostUserId) {
+                        try { ws.send(JSON.stringify({ type: "error", message: "waiting for host" })); } catch(e){}
+                        ws.close(); return;
+                    }
+                    let hostOnline = false;
+                    for (const [, info] of room.clients) {
+                        if (info.userId === room.hostUserId && info.isHost) { hostOnline = true; break; }
+                    }
+                    if (!hostOnline) {
+                        try { ws.send(JSON.stringify({ type: "error", message: "host offline" })); } catch(e){}
+                        ws.close(); return;
+                    }
                 }
             } else {
                 room.hostUserId = myUserId;
@@ -557,5 +564,17 @@ wss.on("connection", (ws) => {
         }
     });
 });
+
+async function shutdown(signal) {
+    console.log(`[Shutdown] ${signal}: flushing persistent workspaces...`);
+    try { await flushPersistentState(); }
+    catch (e) { console.error("[Shutdown] persistence flush failed:", e.message); process.exitCode = 1; }
+    for (const ws of wss.clients) { try { ws.close(1001, "server shutting down"); } catch (_) {} }
+    wss.close();
+    server.close(() => process.exit(process.exitCode || 0));
+    setTimeout(() => process.exit(1), 10000).unref();
+}
+process.once("SIGINT", () => shutdown("SIGINT"));
+process.once("SIGTERM", () => shutdown("SIGTERM"));
 
 restorePersistentState().then(() => server.listen(PORT, () => console.log(`[CollabSync Merged] :${PORT} (public=${PUBLIC_URL || "auto"})`))).catch(err => { console.error("[Persistence] startup failed:", err); process.exit(1); });
