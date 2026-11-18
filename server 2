@@ -454,6 +454,14 @@ wss.on("connection", (ws) => {
                 const info = room.clients.get(ws);
                 const wasHost = info && info.isHost;
                 room.clients.delete(ws);
+                if (info && room.locks) {
+                    for (const [objectId, lock] of room.locks.entries()) {
+                        if (lock.userId === info.userId) {
+                            room.locks.delete(objectId);
+                            broadcast(room, {type:"lock_state", objectId, lock:null});
+                        }
+                    }
+                }
                 
                 if (wasHost && room.clients.size > 0 && !room.persistent) {
                     broadcast(room, {type:"host_left"});
