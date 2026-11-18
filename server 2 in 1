@@ -21,7 +21,6 @@ const MAX_HISTORY      = 8000;
 const ALLOWED_DELTA_KINDS = new Set(["create", "update", "delete", "select", "camera"]);
 
 const TESTER_IDS   = new Set((process.env.TESTER_IDS || "").split(",").map(s=>s.trim()).filter(Boolean));
-const TESTER_NAMES = new Set((process.env.TESTER_NAMES || "").split(",").map(s=>s.trim()).filter(Boolean));
 
 const lobbies       = new Map();
 const rooms         = new Map();
@@ -31,9 +30,8 @@ const rateLimit     = new Map();
 function now() { return Date.now(); }
 function getUserRoles(userId, userName) {
     const idStr = String(userId || "");
-    const name  = String(userName || "");
     return {
-        isTester: TESTER_IDS.has(idStr) || TESTER_NAMES.has(name),
+        isTester: TESTER_IDS.has(idStr),
         isBanned: bannedUsers.has(idStr) || bannedUsers.has(name),
     };
 }
