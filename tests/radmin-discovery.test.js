@@ -287,6 +287,10 @@ test("Server 1 and Server 2 support a real two-client collaboration session", as
             .then(() => true, () => false);
         guestSocket.send(JSON.stringify({type:"delta", id:"locked-edit", objectId:"locked-edit", kind:"update", props:{Name:"must not pass lock"}}));
         assert.equal(await blockedByLock, false, "server must reject edits while another participant holds the object lock");
+        const unauthorizedRelease = waitForMessage(guestSocket, message => message.type === "lock_state" && message.objectId === "locked-edit" && message.lock === null, 250)
+            .then(() => true, () => false);
+        guestSocket.send(JSON.stringify({type:"lock_release", objectId:"locked-edit"}));
+        assert.equal(await unauthorizedRelease, false, "a participant must not release another participant's lock");
         const unlocked = waitForMessage(guestSocket, message => message.type === "lock_state" && message.objectId === "locked-edit" && message.lock === null, 4000, "lock release broadcast");
         hostSocket.send(JSON.stringify({type:"lock_release", objectId:"locked-edit"}));
         await unlocked;
@@ -566,6 +570,14 @@ test("Server 2-in-1 enforces member ACL and object claims", async () => {
         const conflict = waitForMessage(guestSocket, m => m.type === "lock_conflict" && m.objectId === "combined-object", 4000, "combined lock conflict");
         guestSocket.send(JSON.stringify({type:"lock_request", objectId:"combined-object"}));
         await conflict;
+
+        const disconnectLock = waitForMessage(hostSocket, m => m.type === "lock_state" && m.objectId === "disconnect-lock" && m.lock?.userId === 150002, 4000, "guest lock before disconnect");
+        guestSocket.send(JSON.stringify({type:"lock_request", objectId:"disconnect-lock"}));
+        await disconnectLock;
+        const releasedOnDisconnect = waitForMessage(hostSocket, m => m.type === "lock_state" && m.objectId === "disconnect-lock" && m.lock === null, 4000, "lock release after guest disconnect");
+        guestSocket.close();
+        await releasedOnDisconnect;
+        guestSocket = null;
     } finally {
         for (const socket of [hostSocket, guestSocket]) {
             if (socket && socket.readyState !== WebSocket.CLOSED) socket.close();
