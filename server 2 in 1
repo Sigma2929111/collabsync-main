@@ -604,8 +604,23 @@ wss.on("connection", (ws) => {
     });
 });
 
+const backupTimer = setInterval(() => {
+    const currentTime = now();
+    for (const lobby of lobbies.values()) {
+        const settings = lobby.backupSettings;
+        const room = rooms.get(lobby.id);
+        if (!lobby.persistent || !settings?.enabled || !room || !room.snapshot.length) continue;
+        if (currentTime - Number(settings.lastBackupAt || 0) < Number(settings.intervalMs || 86400000)) continue;
+        const backup = {id:crypto.randomUUID(), createdAt:currentTime, reason:"automatic", snapshot:room.snapshot, history:room.history.slice(-MAX_HISTORY), snapshotSize:room.snapshot.length};
+        lobby.backups = [...(lobby.backups || []), backup].slice(-(settings.retention || 20));
+        settings.lastBackupAt = currentTime;
+        schedulePersist();
+    }
+}, 60000);
+
 async function shutdown(signal) {
     console.log(`[Shutdown] ${signal}: flushing persistent workspaces...`);
+    clearInterval(backupTimer);
     try { await flushPersistentState(); }
     catch (e) { console.error("[Shutdown] persistence flush failed:", e.message); process.exitCode = 1; }
     for (const ws of wss.clients) { try { ws.close(1001, "server shutting down"); } catch (_) {} }
