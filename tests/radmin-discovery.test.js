@@ -593,6 +593,17 @@ test("Server 2-in-1 enforces member ACL and object claims", async () => {
         guestSocket.send(JSON.stringify({type:"delta", id:"combined-event-2", objectId:"combined-object", kind:"update", props:{Name:"allowed"}}));
         assert.equal((await allowed).userId, 150002);
 
+        const guestLock = waitForMessage(hostSocket, m => m.type === "lock_state" && m.objectId === "revoked-lock" && m.lock?.userId === 150002, 4000, "guest lock before permission revocation");
+        guestSocket.send(JSON.stringify({type:"lock_request", objectId:"revoked-lock"}));
+        await guestLock;
+        const lockReleased = waitForMessage(hostSocket, m => m.type === "lock_state" && m.objectId === "revoked-lock" && m.lock === null, 4000, "revoked member lock release");
+        const revokedNotice = waitForMessage(guestSocket, m => m.type === "players" && m.players.some(p => p.userId === 150002 && p.permissions?.edit === false && p.permissions?.delete === false && p.permissions?.move === false && p.permissions?.add === false), 4000, "member permissions revoked");
+        hostSocket.send(JSON.stringify({type:"permissions_update", targetUserId:150002, permissions:{edit:false, delete:false, move:false, add:false}}));
+        await Promise.all([lockReleased, revokedNotice]);
+        const regrantNotice = waitForMessage(guestSocket, m => m.type === "players" && m.players.some(p => p.userId === 150002 && p.permissions?.edit === true && p.permissions?.delete === true && p.permissions?.move === true && p.permissions?.add === true), 4000, "member permissions restored");
+        hostSocket.send(JSON.stringify({type:"permissions_update", targetUserId:150002, permissions:{edit:true, delete:true, move:true, add:true}});
+        await regrantNotice;
+
         const lockState = waitForMessage(guestSocket, m => m.type === "lock_state" && m.objectId === "combined-object" && m.lock?.userId === 150001, 4000, "combined lock state");
         hostSocket.send(JSON.stringify({type:"lock_request", objectId:"combined-object"}));
         await lockState;
