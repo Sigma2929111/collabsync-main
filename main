@@ -2051,9 +2051,7 @@ showReviewPrompt = function(snapshotItems, historyItems)
         end
         table.sort(changes)
         if #changes == 0 then return "Изменение · "..name.." (поля не удалось сравнить)" end
-        local summary = table.concat(changes, "; ", 1, math.min(#changes, 3))
-        if #changes > 3 then summary = summary.." (+"..tostring(#changes - 3).." полей)" end
-        return "Изменение · "..name.." — "..summary
+        return "Изменение · "..name.." — "..table.concat(changes, "; ")
     end
 
     local selected = {}
@@ -2080,7 +2078,9 @@ showReviewPrompt = function(snapshotItems, historyItems)
     for index, delta in ipairs(reviewDeltas) do
         local rowIndex = index
         local rowDelta = delta
-        local row = I("Frame", {Size=UDim2.new(1,-4,0,58), BackgroundColor3=T.surface, BorderSizePixel=0, LayoutOrder=index, ZIndex=303}, list)
+        local description = describeDelta(rowDelta)
+        local rowHeight = math.min(260, math.max(58, 44 + math.ceil(#description / 100) * 14))
+        local row = I("Frame", {Size=UDim2.new(1,-4,0,rowHeight), BackgroundColor3=T.surface, BorderSizePixel=0, LayoutOrder=index, ZIndex=303}, list)
         round(row, 7)
         local check = btn(row, "✓", {size=UDim2.fromOffset(34,34), pos=UDim2.fromOffset(8,12), bg=T.success, hoverBg=T.accent, textSize=14, zIndex=304})
         rowChecks[index] = check
@@ -2090,7 +2090,7 @@ showReviewPrompt = function(snapshotItems, historyItems)
             check.BackgroundColor3 = selected[rowIndex] and T.success or T.surf3
             updateCount()
         end)
-        lbl(row, describeDelta(rowDelta), {textSize=10, color=T.text, wrapped=true, size=UDim2.new(1,-58,1,-8), pos=UDim2.fromOffset(50,4), zIndex=304})
+        lbl(row, description, {textSize=10, color=T.text, wrapped=true, size=UDim2.new(1,-58,1,-8), pos=UDim2.fromOffset(50,4), zIndex=304})
     end
     if #reviewDeltas == 0 then
         lbl(list, "Новых изменений для выборочного применения нет. При принятии будет использован серверный snapshot только если локальная сцена пуста.", {textSize=11, color=T.muted, wrapped=true, size=UDim2.new(1,-20,0,48), pos=UDim2.fromOffset(8,8), zIndex=304})
