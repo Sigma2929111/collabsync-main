@@ -1591,12 +1591,14 @@ local sTabGui = btn(STabs, "Интерфейс", {size=UDim2.fromOffset(140,34),
 local sTabPlace = btn(STabs, "Доступ", {size=UDim2.fromOffset(150,34), pos=UDim2.fromOffset(150,5), bg=T.surface, hoverBg=T.surf2, textSize=13})
 local sTabPerms = btn(STabs, "Права", {size=UDim2.fromOffset(150,34), pos=UDim2.fromOffset(305,5), bg=T.surface, hoverBg=T.surf2, textSize=13})
 local sTabBlack = btn(STabs, "Blacklist ⭐", {size=UDim2.fromOffset(150,34), pos=UDim2.fromOffset(460,5), bg=T.surface, hoverBg=T.surf2, textSize=13})
+local sTabBackups = btn(STabs, "Бэкапы", {size=UDim2.fromOffset(140,34), pos=UDim2.fromOffset(615,5), bg=T.surface, hoverBg=T.surf2, textSize=13})
 
 local SContent = I("Frame", {Size=UDim2.new(1,-40,1,-140), Position=UDim2.fromOffset(20,130), BackgroundTransparency=1}, S)
 local SGui = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1}, SContent)
 local SPlace = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Visible=false}, SContent)
 local SPerms = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Visible=false}, SContent)
 local SBlack = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Visible=false}, SContent)
+local SBackups = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Visible=false}, SContent)
 
 local function toggleRow(parent, label, yPos, initialOn, callback)
     local r = I("Frame", {Size=UDim2.new(1,0,0,44), Position=UDim2.fromOffset(0,yPos), BackgroundColor3=T.surface, BorderSizePixel=0}, parent)
@@ -1790,6 +1792,49 @@ refreshPerms = function()
     end
 end
 
+-- Persistent workspace backups (Server 2-in-1)
+lbl(SBackups, "Резервные копии рабочего пространства", {font=Enum.Font.GothamBold, textSize=16, size=UDim2.new(1,0,0,24)})
+lbl(SBackups, "Автоматические копии выключены по умолчанию. Расписание: раз в 24 часа, хранение: 20 копий.", {textSize=12, color=T.muted, size=UDim2.new(1,0,0,34), pos=UDim2.fromOffset(0,28)})
+local backupStatus = lbl(SBackups, "Статус: настройки не загружены", {textSize=12, color=T.muted, size=UDim2.new(1,0,0,22), pos=UDim2.fromOffset(0,66)})
+local backupList = I("Frame", {Size=UDim2.new(1,0,1,-180), Position=UDim2.fromOffset(0,104), BackgroundColor3=T.surface, BorderSizePixel=0}, SBackups)
+round(backupList, 10); outline(backupList, T.border, 1); pad(backupList, 8)
+I("UIListLayout", {Padding=UDim.new(0,6)}, backupList)
+local function backupRequest(path, method, body)
+    if not State.session or not currentLobby then return false, "Нет активного лобби" end
+    local base = tostring(State.session.hostUrl or ""):gsub("/+$", "")
+    return httpJson(base .. path, method, body, {["Content-Type"]="application/json", ["Authorization"]="Bearer "..tostring(State.session.token or "")})
+end
+local function refreshBackups()
+    if not State.session or not currentLobby or not isOwnLobby then backupStatus.Text = "Доступно только владельцу активного лобби"; return end
+    local ok, data = backupRequest("/api/workspace/"..tostring(currentLobby.id).."/backups", "GET")
+    if not ok then backupStatus.Text = "Ошибка загрузки: "..tostring(data and data.error or data); return end
+    local settings = data.settings or {}
+    backupStatus.Text = "Автокопии: "..(settings.enabled and "ВКЛ" or "ВЫКЛ").." | копий: "..tostring(#(data.backups or {}))
+    for _, child in ipairs(backupList:GetChildren()) do if child:IsA("Frame") then child:Destroy() end end
+    for _, backup in ipairs(data.backups or {}) do
+        local row = I("Frame", {Size=UDim2.new(1,-4,0,38), BackgroundColor3=T.surf2, BorderSizePixel=0}, backupList)
+        round(row, 7)
+        local stamp = os.date("%d.%m.%Y %H:%M", math.floor((tonumber(backup.createdAt) or 0)/1000))
+        lbl(row, stamp.." · "..tostring(backup.reason).." · "..tostring(backup.snapshotSize).." объектов", {textSize=11, size=UDim2.new(1,-110,1,0), pos=UDim2.fromOffset(8,0)})
+        local restore = btn(row, "Откатить", {size=UDim2.fromOffset(88,26), pos=UDim2.new(1,-96,0.5,-13), bg=T.surface, hoverBg=T.danger, textSize=11})
+        restore.MouseButton1Click:Connect(function()
+            local rok, result = backupRequest("/api/workspace/backups/restore", "POST", {lobbyId=currentLobby.id, backupId=backup.id})
+            if rok then showToast(S, "Копия восстановлена. Переподключите лобби.", T.success) else showToast(S, "Ошибка отката: "..tostring(result and result.error or result), T.danger) end
+        end)
+    end
+end
+local backupEnable = toggleRow(SBackups, "Автоматически создавать копии", 142, false, function(enabled)
+    local ok, data = backupRequest("/api/workspace/backups/settings", "POST", {lobbyId=currentLobby.id, enabled=enabled, intervalMs=86400000, retention=20})
+    if ok then backupStatus.Text = "Автокопии: "..(enabled and "ВКЛ" or "ВЫКЛ").." · 24 часа · 20 копий" else showToast(S, "Не удалось сохранить настройки", T.danger) end
+end)
+local manualBackupBtn = btn(SBackups, "Создать копию сейчас", {size=UDim2.fromOffset(190,34), pos=UDim2.fromOffset(0,194), bg=T.accent, hoverBg=T.accent2, textSize=12})
+manualBackupBtn.MouseButton1Click:Connect(function()
+    local ok, data = backupRequest("/api/workspace/backups/create", "POST", {lobbyId=currentLobby.id})
+    if ok then showToast(S, "Резервная копия создана", T.success); refreshBackups() else showToast(S, "Ошибка: "..tostring(data and data.error or data), T.danger) end
+end)
+local refreshBackupBtn = btn(SBackups, "Обновить", {size=UDim2.fromOffset(110,34), pos=UDim2.fromOffset(200,194), bg=T.surface, hoverBg=T.surf2, textSize=12})
+refreshBackupBtn.MouseButton1Click:Connect(refreshBackups)
+
 -- Blacklist
 local blacklistBody = I("Frame", {Size=UDim2.new(1,0,1,-130), Position=UDim2.fromOffset(0,54), BackgroundColor3=T.surface, BorderSizePixel=0}, SBlack)
 round(blacklistBody, 10); outline(blacklistBody, T.border, 1); pad(blacklistBody, 10)
@@ -1828,17 +1873,19 @@ blAddBtn.MouseButton1Click:Connect(function()
 end)
 
 local function switchSTab(which)
-    SGui.Visible = (which == "gui"); SPlace.Visible = (which == "place"); SPerms.Visible = (which == "perms"); SBlack.Visible = (which == "black")
+    SGui.Visible = (which == "gui"); SPlace.Visible = (which == "place"); SPerms.Visible = (which == "perms"); SBlack.Visible = (which == "black"); SBackups.Visible = (which == "backups")
     sTabGui.BackgroundColor3 = (which == "gui") and T.accent or T.surface
     sTabPlace.BackgroundColor3 = (which == "place") and T.accent or T.surface
     sTabPerms.BackgroundColor3 = (which == "perms") and T.accent or T.surface
     sTabBlack.BackgroundColor3 = (which == "black") and T.accent or T.surface
+    sTabBackups.BackgroundColor3 = (which == "backups") and T.accent or T.surface
 end
 
 sTabGui.MouseButton1Click:Connect(function() switchSTab("gui") end)
 sTabPlace.MouseButton1Click:Connect(function() refreshWhitelist(); switchSTab("place") end)
 sTabPerms.MouseButton1Click:Connect(function() refreshPerms(); switchSTab("perms") end)
 sTabBlack.MouseButton1Click:Connect(function() rebuildBlacklistUI(); switchSTab("black") end)
+sTabBackups.MouseButton1Click:Connect(function() refreshBackups(); switchSTab("backups") end)
 
 local openSettings = function(context)
     previousScreen = lastVisibleFrame
@@ -1852,6 +1899,7 @@ local openSettings = function(context)
     sTabPlace.Visible = (currentWhitelistScope ~= nil)
     sTabPerms.Visible = (context == "inplace" and isOwnLobby)
     sTabBlack.Visible = isOwnerRole
+    sTabBackups.Visible = (context == "inplace" and isOwnLobby)
     switchSTab("gui")
 end
 settingsBtn.MouseButton1Click:Connect(function() openSettings("main") end)
