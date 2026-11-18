@@ -2144,7 +2144,7 @@ connectWebSocket = function(hostUrl, token, isHost, onReady, onFail, isReconnect
                 if State.connected and State.session then
                     local hostFound = false
                     for _, p in ipairs(State.remotePlayers) do if p.isHost then hostFound = true; break end end
-                    if not hostFound then
+                    if not hostFound and not (State.session and State.session.persistent) then
                         logMsg("lobby", "warn", "Хост не найден, выход")
                         exitLobbyUI()
                     end
