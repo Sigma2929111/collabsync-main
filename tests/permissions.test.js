@@ -18,7 +18,6 @@ test("create, delete, property edits and movement require their matching permiss
     assert.equal(canApplyDelta(none, {kind:"update", parentId:"folder"}), false);
     assert.equal(canApplyDelta(none, {kind:"select"}), true);
     assert.equal(canApplyDelta(none, {kind:"camera"}), true);
-    assert.equal(canApplyDelta(none, {kind:"select"}), true);
 });
 
 test("movement and property edits are independently controlled", () => {
