@@ -2456,7 +2456,17 @@ publishLobby = function()
         placeName = game.Name,
         persistent = persistentLobbyOn
     })
-    
+
+    if ok and res and res.lobbyId and persistentLobbyOn and res.persistent ~= true then
+        pcall(function()
+            httpJson(CATALOG_URL.."/api/lobby/delete", "POST", {lobbyId=res.lobbyId}, {
+                ["Content-Type"]="application/json", ["Authorization"]="Bearer "..tostring(res.token or "")
+            })
+        end)
+        showToast(Create, "Долгосрочные лобби пока поддерживаются только в Server 2-in-1", T.danger)
+        return
+    end
+
     if ok and res and res.lobbyId and res.token then
         State.session = {
             lobbyId = res.lobbyId,
