@@ -164,9 +164,9 @@ wss.on("connection", (ws) => {
         const room = getRoom(lobbyId);
         const clientInfo = room.clients.get(ws);
         
-        if (msg.type === "request_snapshot") { 
-            sendSnapshotChunks(ws, room).catch(()=>{}); 
-            return; 
+        if (msg.type === "request_snapshot") {
+            if (clientInfo) sendSnapshotChunks(ws, room).catch(()=>{});
+            return;
         }
         
         // Роли нельзя назначать сообщением клиента: они берутся только из подписанного JWT.
