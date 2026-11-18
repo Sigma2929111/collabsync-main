@@ -1,4 +1,6 @@
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
 const { detectRadminIPv4, isLoopbackRequest } = require("./radmin-network");
 const { WebSocketServer } = require("ws");
 const jwt = require("jsonwebtoken");
@@ -11,6 +13,36 @@ const HOST_PUBLIC_URL = process.env.HOST_PUBLIC_URL || "";
 const CHUNK_SIZE = 200;
 const CHUNK_DELAY_MS = 60;
 const MAX_HISTORY = 8000; // Ограничение истории по числу событий
+const DATA_DIR = process.env.COLLABSYNC_DATA_DIR || path.join(__dirname, ".collabsync-data");
+const STATE_FILE = path.join(DATA_DIR, "server2-state.json");
+let persistTimer = null, persistQueue = Promise.resolve();
+async function flushPersistentRooms() {
+    if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+    const state = { version: 1, rooms: [...rooms.entries()].filter(([, r]) => r.persistent).map(([id, r]) => [id, { snapshot: r.snapshot, history: r.history.slice(-MAX_HISTORY), hostUserId: r.hostUserId, lastHostPing: r.lastHostPing }]) };
+    const data = JSON.stringify(state);
+    persistQueue = persistQueue.catch(() => {}).then(async () => {
+        await fs.promises.mkdir(DATA_DIR, { recursive: true });
+        const tmp = STATE_FILE + ".tmp";
+        await fs.promises.writeFile(tmp, data, { mode: 0o600 });
+        await fs.promises.rename(tmp, STATE_FILE);
+    });
+    await persistQueue;
+}
+function schedulePersist() {
+    if (persistTimer) clearTimeout(persistTimer);
+    persistTimer = setTimeout(() => { persistTimer = null; flushPersistentRooms().catch(e => console.error("[Persistence] room save failed:", e.message)); }, 250);
+}
+async function restorePersistentRooms() {
+    try {
+        const state = JSON.parse(await fs.promises.readFile(STATE_FILE, "utf8"));
+        if (state.version !== 1 || !Array.isArray(state.rooms)) throw new Error("unsupported Server 2 state format");
+        for (const [id, saved] of state.rooms) {
+            if (typeof id !== "string" || !saved || !Array.isArray(saved.snapshot) || !Array.isArray(saved.history)) continue;
+            rooms.set(id, { clients: new Map(), snapshot: saved.snapshot, history: saved.history.slice(-MAX_HISTORY), hostUserId: Number(saved.hostUserId) || null, lastHostPing: Number(saved.lastHostPing) || Date.now(), persistent: true });
+        }
+        console.log(`[Persistence] restored ${rooms.size} persistent Server 2 rooms`);
+    } catch (e) { if (e.code !== "ENOENT") console.error("[Persistence] Server 2 restore failed:", e.message); }
+}
 const MAX_ROOM_CLIENTS = 32;
 const WS_MESSAGES_PER_10S = 180;
 const CHAT_MESSAGES_PER_10S = 6;
@@ -20,7 +52,7 @@ const rooms = new Map();
 
 function getRoom(lobbyId) {
     if (!rooms.has(lobbyId)) {
-        rooms.set(lobbyId, { clients: new Map(), snapshot: [], history: [], hostUserId: null, lastHostPing: Date.now() });
+        rooms.set(lobbyId, { clients: new Map(), snapshot: [], history: [], hostUserId: null, lastHostPing: Date.now(), persistent: false });
     }
     return rooms.get(lobbyId);
 }
@@ -81,7 +113,7 @@ async function sendSnapshotChunks(ws, room) {
 setInterval(() => {
     const now = Date.now();
     for (const [lobbyId, room] of rooms.entries()) {
-        if (room.hostUserId) {
+        if (room.hostUserId && !room.persistent) {
             let hostOnline = false;
             for (const [, info] of room.clients) {
                 if (info.userId === room.hostUserId && info.isHost) {
@@ -133,7 +165,8 @@ wss.on("connection", (ws) => {
             }
             
             const room = getRoom(lobbyId);
-            for (const [oldWs, info] of room.clients.entries()) {
+            room.persistent = room.persistent || decoded.persistent === true;
+            for (const [oldWs/, info] of room.clients.entries()) {
                 if (info.userId === myUserId) {
                     try { oldWs.close(); } catch(e) {}
                     room.clients.delete(oldWs);
@@ -197,7 +230,8 @@ wss.on("connection", (ws) => {
             if (clientInfo && clientInfo.isHost && !clientInfo.isTester && Array.isArray(msg.data) && msg.data.length <= 60000) {
                 room.snapshot = msg.data;
                 room.history = [];
-                console.log(`[Snapshot] ${lobbyId}: ${room.snapshot.length} items`);
+                if (room.persistent) schedulePersist();
+                console.log/(`[Snapshot] ${lobbyId}: ${room.snapshot.length} items`);
             }
             return;
         }
@@ -214,6 +248,7 @@ wss.on("connection", (ws) => {
             if (msg.kind !== "camera") {
                 room.history.push(trustedDelta);
                 if (room.history.length > MAX_HISTORY) room.history.shift();
+                if (room.persistent) schedulePersist();
             }
             broadcast(room, trustedDelta, ws);
             return;
@@ -281,7 +316,7 @@ wss.on("connection", (ws) => {
                 const wasHost = info && info.isHost;
                 room.clients.delete(ws);
                 
-                if (wasHost && room.clients.size > 0) {
+                if (wasHost && room.clients.size > 0 && !room.persistent) {
                     broadcast(room, {type:"host_left"});
                     setTimeout(() => {
                         for (const [c] of room.clients) { 
@@ -296,7 +331,7 @@ wss.on("connection", (ws) => {
                 if (room.clients.size === 0) {
                     setTimeout(() => { 
                         const r = rooms.get(lobbyId); 
-                        if (r && r.clients.size === 0) rooms.delete(lobbyId); 
+                        if (r && r.clients.size === 0 && !r.persistent) rooms.delete(lobbyId); 
                     }, 60000);
                 }
             }
@@ -309,4 +344,15 @@ setInterval(() => {
     fetch(url).catch(()=>{});
 }, 10000);
 
-server.listen(PORT, () => console.log(`[CollabSync Host] listening ${PORT}`));
+async function shutdown(signal) {
+    console.log(`[Shutdown] ${signal}: flushing persistent rooms...`);
+    try { await flushPersistentRooms(); }
+    catch (e) { console.error("[Shutdown] persistence flush failed:", e.message); process.exitCode = 1; }
+    for (const ws of wss.clients) { try { ws.close(1001, "server shutting down"); } catch (_) {} }
+    wss.close();
+    server.close(() => process.exit(process.exitCode || 0));
+    setTimeout(() => process.exit(1), 10000).unref();
+}
+process.once("SIGINT", () => shutdown("SIGINT"));
+process.once("SIGTERM", () => shutdown("SIGTERM"));
+restorePersistentRooms().then(() => server.listen(PORT, () => console.log(`[CollabSync Host] listening ${PORT}`))).catch(err => { console.error("[Persistence] Server 2 startup failed:", err); process.exit(1); });
