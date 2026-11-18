@@ -249,7 +249,7 @@ test("Server 1 and Server 2 support a real two-client collaboration session", as
         const deniedKinds = [
             {id:"acl-delete-denied", kind:"delete"},
             {id:"acl-move-denied", kind:"update", props:{Position:{x:1,y:2,z:3}}},
-            {id:"acl-parent-denied", kind:"update", parentId:"service:ServerStorage"},
+            {id:"acl-parent-denied", kind:"update", parentId:"service:ServerStorage", props:{}},
             {id:"acl-create-denied", kind:"create", name:"blocked", className:"Part", parentId:"service:Workspace", props:{Name:"blocked"}},
         ];
         for (const candidate of deniedKinds) {
@@ -270,7 +270,7 @@ test("Server 1 and Server 2 support a real two-client collaboration session", as
         await grantRemaining;
         for (const candidate of [
             {id:"acl-move-allowed", kind:"update", props:{Position:{x:4,y:5,z:6}}},
-            {id:"acl-parent-allowed", kind:"update", parentId:"service:ServerStorage"},
+            {id:"acl-parent-allowed", kind:"update", parentId:"service:ServerStorage", props:{}},
             {id:"acl-delete-allowed", kind:"delete"},
             {id:"acl-create-allowed", kind:"create", name:"allowed", className:"Part", parentId:"service:Workspace", props:{Name:"allowed"}},
         ]) {
