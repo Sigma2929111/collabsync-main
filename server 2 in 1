@@ -297,10 +297,14 @@ wss.on("connection", (ws) => {
         if (msg.type === "hello") {
             try {
                 const decoded = jwt.verify(msg.token, JWT_SECRET);
+                if (typeof decoded.lobbyId !== "string" || !decoded.lobbyId || !Number.isSafeInteger(Number(decoded.userId)) || Number(decoded.userId) <= 0) {
+                    throw new Error("invalid token claims");
+                }
                 lobbyId    = decoded.lobbyId;
-                myUserId   = Number(decoded.userId) || Number(msg.userId);
-                myUserName = decoded.userName || msg.userName || String(myUserId);
-                myIsHost   = !!decoded.isHost;
+                myUserId   = Number(decoded.userId);
+                myUserName = String(decoded.userName || myUserId).slice(0, 32);
+                myIsHost   = decoded.isHost === true;
+                myIsTester = decoded.isTester === true;
             } catch(e) {
                 try { ws.send(JSON.stringify({ type: "error", message: "bad token" })); } catch(x){}
                 try { ws.close(); } catch(x){}
