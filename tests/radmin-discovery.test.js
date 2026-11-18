@@ -224,6 +224,9 @@ test("Server 1 and Server 2 support a real two-client collaboration session", as
             .then(() => true, () => false);
         guestSocket.send(JSON.stringify({type:"delta", id:"acl-denied", kind:"update", props:{Name:"blocked"}}));
         assert.equal(await deniedDelta, false, "server must reject an update without edit permission");
+        const readOnlyLock = waitForMessage(hostSocket, message => message.type === "lock_state" && message.objectId === "read-only-lock", 250).then(() => true, () => false);
+        guestSocket.send(JSON.stringify({type:"lock_request", objectId:"read-only-lock"}));
+        assert.equal(await readOnlyLock, false, "a participant with no mutation permissions must not lock objects");
 
         const allowUpdate = waitForMessage(guestSocket, message =>
             message.type === "players" && message.players.some(p => p.userId === 120002 && p.permissions && p.permissions.edit === true)
@@ -579,6 +582,9 @@ test("Server 2-in-1 enforces member ACL and object claims", async () => {
         const denied = waitForMessage(hostSocket, m => m.type === "delta" && m.objectId === "combined-object", 250).then(() => true, () => false);
         guestSocket.send(JSON.stringify({type:"delta", id:"combined-event-1", objectId:"combined-object", kind:"update", props:{Name:"blocked"}}));
         assert.equal(await denied, false, "combined server must reject denied property edits");
+        const readOnlyLock = waitForMessage(hostSocket, m => m.type === "lock_state" && m.objectId === "combined-read-only-lock", 250).then(() => true, () => false);
+        guestSocket.send(JSON.stringify({type:"lock_request", objectId:"combined-read-only-lock"}));
+        assert.equal(await readOnlyLock, false, "combined server must not let read-only members lock objects");
 
         const allowNotice = waitForMessage(guestSocket, m => m.type === "players" && m.players.some(p => p.userId === 150002 && p.permissions?.edit === true), 4000, "combined ACL allow notice");
         hostSocket.send(JSON.stringify({type:"permissions_update", targetUserId:150002, permissions:{edit:true, delete:false, move:false, add:false}}));
