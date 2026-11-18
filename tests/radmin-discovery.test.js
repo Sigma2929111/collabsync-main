@@ -593,6 +593,9 @@ test("Server 2-in-1 enforces member ACL and object claims", async () => {
         const conflict = waitForMessage(guestSocket, m => m.type === "lock_conflict" && m.objectId === "combined-object", 4000, "combined lock conflict");
         guestSocket.send(JSON.stringify({type:"lock_request", objectId:"combined-object"}));
         await conflict;
+        const spoofedDelta = waitForMessage(hostSocket, m => m.type === "delta" && m.id === "combined-object", 250).then(() => true, () => false);
+        guestSocket.send(JSON.stringify({type:"delta", id:"combined-object", objectId:"unlocked-spoof", kind:"update", props:{Name:"blocked by actual object lock"}}));
+        assert.equal(await spoofedDelta, false, "combined server must enforce the lock for the actual delta target");
 
         const disconnectLock = waitForMessage(hostSocket, m => m.type === "lock_state" && m.objectId === "disconnect-lock" && m.lock?.userId === 150002, 4000, "guest lock before disconnect");
         guestSocket.send(JSON.stringify({type:"lock_request", objectId:"disconnect-lock"}));
