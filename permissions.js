@@ -30,7 +30,9 @@ function canApplyDelta(permissions, delta) {
         if (hasOtherEdit && !p.edit) return false;
         return hasMove || hasOtherEdit;
     }
-    return delta.kind === "select" || delta.kind === "camera";
+    if (delta.kind === "select") return p.select;
+    if (delta.kind === "camera") return p.camera;
+    return false;
 }
 
 module.exports = { DEFAULT_PERMISSIONS, normalizePermissions, canApplyDelta };
