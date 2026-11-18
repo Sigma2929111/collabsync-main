@@ -6,6 +6,8 @@ const { WebSocketServer } = require("ws");
 const jwt      = require("jsonwebtoken");
 const bcrypt   = require("bcryptjs");
 const crypto   = require("crypto");
+const fs = require("fs");
+const path = require("path");
 
 const PORT             = process.env.PORT || 3000;
 const JWT_SECRET       = process.env.JWT_SECRET || "";
@@ -26,7 +28,35 @@ const ALLOWED_DELTA_KINDS = new Set(["create", "update", "delete", "select", "ca
 const TESTER_IDS   = new Set((process.env.TESTER_IDS || "").split(",").map(s=>s.trim()).filter(Boolean));
 
 const lobbies       = new Map();
-const rooms         = new Map();
+const rooms = new Map();
+const DATA_DIR = process.env.COLLABSYNC_DATA_DIR || path.join(__dirname, ".collabsync-data");
+const STATE_FILE = path.join(DATA_DIR, "state.json");
+let persistTimer = null, persistQueue = Promise.resolve();
+function schedulePersist() {
+    if (persistTimer) clearTimeout(persistTimer);
+    persistTimer = setTimeout(() => {
+        persistTimer = null;
+        const keep = [...lobbies.values()].filter(l => l.persistent);
+        const ids = new Set(keep.map(l => l.id));
+        const state = { version: 1, lobbies: keep, rooms: [...rooms.entries()].filter(([id]) => ids.has(id)).map(([id, r]) => [id, { snapshot: r.snapshot, history: r.history, hostUserId: r.hostUserId, lastHostPing: r.lastHostPing }]) };
+        const data = JSON.stringify(state);
+        persistQueue = persistQueue.then(async () => {
+            await fs.promises.mkdir(DATA_DIR, { recursive: true });
+            const tmp = STATE_FILE + ".tmp";
+            await fs.promises.writeFile(tmp, data, { mode: 0o600 });
+            await fs.promises.rename(tmp, STATE_FILE);
+        }).catch(e => console.error("[Persistence] save failed:", e.message));
+    }, 250);
+}
+async function restorePersistentState() {
+    try {
+        const state = JSON.parse(await fs.promises.readFile(STATE_FILE, "utf8"));
+        if (state.version !== 1 || !Array.isArray(state.lobbies) || !Array.isArray(state.rooms)) throw new Error("unsupported state format");
+        for (const l of state.lobbies) if (l && typeof l.id === "string" && l.persistent) lobbies.set(l.id, l);
+        for (const [id, saved] of state.rooms) if (lobbies.has(id) && saved && Array.isArray(saved.snapshot) && Array.isArray(saved.history)) rooms.set(id, { clients: new Map(), snapshot: saved.snapshot, history: saved.history.slice(-MAX_HISTORY), hostUserId: saved.hostUserId || null, lastHostPing: saved.lastHostPing || now() });
+        console.log(`[Persistence] restored ${lobbies.size} persistent workspaces`);
+    } catch (e) { if (e.code !== "ENOENT") console.error("[Persistence] restore failed:", e.message); }
+}
 const bannedUsers   = new Set();
 const rateLimit     = new Map();
 
@@ -86,8 +116,10 @@ app.post("/api/lobby/create", async (req, res) => {
             hostId: hostUid, hostName: String(hostName || hostUid).slice(0, 32),
             passwordHash, isPrivate: !!isPrivate,
             hostUrl, placeId: placeId || null, placeName: placeName || null,
-            createdAt: now(), lastPing: now(),
+            createdAt: now(), lastPing: now(), persistent: req.body?.persistent === true,
+            backupSettings: { enabled: false, intervalMs: 86400000, retention: 20 }, backups: [],
         });
+        schedulePersist();
 
         const token = jwt.sign(
             { lobbyId, userId: hostUid, userName: String(hostName || hostUid).slice(0, 32), isHost: true, isTester: false, lobbyName: String(name) },
@@ -113,7 +145,7 @@ app.post("/api/lobby/join", async (req, res) => {
         const ok = await bcrypt.compare(String(password), lobby.passwordHash);
         if (!ok) return res.status(403).json({ error: "invalid password" });
     }
-    if (now() - lobby.lastPing > HEARTBEAT_TIMEOUT_MS) {
+    if (!lobby.persistent && now() - lobby.lastPing > HEARTBEAT_TIMEOUT_MS) {
         lobbies.delete(lobbyId);
         return res.status(410).json({ error: "lobby expired" });
     }
@@ -158,6 +190,7 @@ app.post("/api/lobby/heartbeat", (req, res) => {
         return res.status(403).json({ error: "forbidden" });
     }
     lobby.lastPing = now();
+    schedulePersist();
     res.json({ ok: true });
 });
 
@@ -174,8 +207,45 @@ app.post("/api/lobby/delete", (req, res) => {
     if (!decoded.isHost || decoded.lobbyId !== lobbyId || Number(decoded.userId) !== lobby.hostId) {
         return res.status(403).json({ error: "forbidden" });
     }
-    lobbies.delete(lobbyId);
+    lobbies.delete(lobbyId); rooms.delete(lobbyId); schedulePersist();
     res.json({ ok: true });
+});
+
+function ownerForWorkspace(req, res) {
+    const auth = String(req.headers.authorization || ""), token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    try {
+        const claims = jwt.verify(token, JWT_SECRET), id = String(req.params.lobbyId || req.body?.lobbyId || "");
+        const lobby = lobbies.get(id);
+        if (!lobby) { res.status(404).json({ error: "workspace not found" }); return null; }
+        if (!claims.isHost || claims.lobbyId !== id || Number(claims.userId) !== lobby.hostId) { res.status(403).json({ error: "owner required" }); return null; }
+        return lobby;
+    } catch (_) { res.status(401).json({ error: "unauthorized" }); return null; }
+}
+app.get("/api/workspace/:lobbyId/backups", (req, res) => {
+    const l = ownerForWorkspace(req, res); if (!l) return;
+    res.json({ settings: l.backupSettings, backups: (l.backups || []).map(({id, createdAt, reason, snapshotSize}) => ({id, createdAt, reason, snapshotSize})) });
+});
+app.post("/api/workspace/backups/settings", (req, res) => {
+    const l = ownerForWorkspace(req, res); if (!l) return;
+    const intervalMs = Number(req.body?.intervalMs || 86400000), retention = Number(req.body?.retention || 20);
+    if (!Number.isSafeInteger(intervalMs) || intervalMs < 3600000 || intervalMs > 2592000000 || !Number.isInteger(retention) || retention < 1 || retention > 100) return res.status(400).json({ error: "invalid backup settings" });
+    l.backupSettings = { enabled: req.body?.enabled === true, intervalMs, retention }; schedulePersist();
+    res.json({ ok: true, settings: l.backupSettings });
+});
+app.post("/api/workspace/backups/create", (req, res) => {
+    const l = ownerForWorkspace(req, res); if (!l) return;
+    const room = rooms.get(l.id); if (!room || !room.snapshot.length) return res.status(409).json({ error: "no snapshot available" });
+    const b = { id: crypto.randomUUID(), createdAt: now(), reason: "manual", snapshot: room.snapshot, history: room.history.slice(-MAX_HISTORY), snapshotSize: room.snapshot.length };
+    l.backups = [...(l.backups || []), b].slice(-(l.backupSettings?.retention || 20)); schedulePersist();
+    res.json({ ok: true, backup: { id: b.id, createdAt: b.createdAt, snapshotSize: b.snapshotSize } });
+});
+app.post("/api/workspace/backups/restore", (req, res) => {
+    const l = ownerForWorkspace(req, res); if (!l) return;
+    const room = rooms.get(l.id), b = (l.backups || []).find(x => x.id === req.body?.backupId);
+    if (!room || !b) return res.status(404).json({ error: "backup not found" });
+    if (room.snapshot.length) { const safe = { id: crypto.randomUUID(), createdAt: now(), reason: "pre-restore", snapshot: room.snapshot, history: room.history, snapshotSize: room.snapshot.length }; l.backups = [...(l.backups || []), safe].slice(-(l.backupSettings?.retention || 20)); }
+    room.snapshot = b.snapshot; room.history = b.history || []; schedulePersist();
+    res.json({ ok: true, restoredBackupId: b.id, snapshotSize: room.snapshot.length, note: "Reconnect the Studio plugin to load the restored snapshot." });
 });
 
 app.get("/api/user/roles", (req, res) => {
@@ -287,7 +357,7 @@ setInterval(() => {
 setInterval(() => {
     const t = now();
     for (const [id, l] of lobbies.entries()) {
-        if (t - l.lastPing > HEARTBEAT_TIMEOUT_MS) lobbies.delete(id);
+        if (!l.persistent && t - l.lastPing > HEARTBEAT_TIMEOUT_MS) lobbies.delete(id);
     }
 }, 15000);
 
@@ -329,7 +399,8 @@ wss.on("connection", (ws) => {
                 }
             }
 
-            if (!myIsHost) {
+            const persistentLobby = lobbies.get(lobbyId)?.persistent === true;
+            if (!myIsHost && !persistentLobby) {
                 if (!room.hostUserId) {
                     try { ws.send(JSON.stringify({ type: "error", message: "waiting for host" })); } catch(e){}
                     ws.close(); return;
@@ -376,7 +447,7 @@ wss.on("connection", (ws) => {
         if (msg.type === "request_snapshot") { if (clientInfo) sendSnapshotChunks(ws, room).catch(()=>{}); return; }
         // Роли нельзя назначать сообщением клиента: они берутся только из подписанного JWT.
         if (msg.type === "snapshot") {
-            if (clientInfo && clientInfo.isHost && !clientInfo.isTester && Array.isArray(msg.data) && msg.data.length <= 60000) { room.snapshot = msg.data; room.history = []; }
+            if (clientInfo && clientInfo.isHost && !clientInfo.isTester && Array.isArray(msg.data) && msg.data.length <= 60000) { room.snapshot = msg.data; room.history = []; if (lobbies.get(lobbyId)?.persistent) schedulePersist(); }
             return;
         }
         if (msg.type === "delta") {
@@ -390,6 +461,7 @@ wss.on("connection", (ws) => {
             if (msg.kind !== "camera") {
                 room.history.push(trustedDelta);
                 if (room.history.length > MAX_HISTORY) room.history.shift();
+                if (lobbies.get(lobbyId)?.persistent) schedulePersist();
             }
             broadcast(room, trustedDelta, ws);
             return;
@@ -427,7 +499,7 @@ wss.on("connection", (ws) => {
         if (msg.type === "leave") {
             const wasHost = clientInfo && clientInfo.isHost;
             room.clients.delete(ws);
-            if (wasHost) {
+            if (wasHost && !lobbies.get(lobbyId)?.persistent) {
                 broadcast(room, { type: "host_left" });
                 setTimeout(() => {
                     for (const [c] of room.clients) { try { c.send(JSON.stringify({ type: "host_left" })); c.close(); } catch(e){} }
@@ -448,7 +520,7 @@ wss.on("connection", (ws) => {
         const info = room.clients.get(ws);
         const wasHost = info && info.isHost;
         room.clients.delete(ws);
-        if (wasHost && room.clients.size > 0) {
+        if (wasHost && room.clients.size > 0 && !lobbies.get(lobbyId)?.persistent) {
             broadcast(room, { type: "host_left" });
             setTimeout(() => {
                 for (const [c] of room.clients) { try { c.send(JSON.stringify({ type: "host_left" })); c.close(); } catch(e){} }
@@ -457,7 +529,7 @@ wss.on("connection", (ws) => {
             }, 1000);
         }
         sendPlayers(room);
-        if (room.clients.size === 0) {
+        if (room.clients.size === 0 && !lobbies.get(lobbyId)?.persistent) {
             setTimeout(() => {
                 const r = rooms.get(lobbyId);
                 if (r && r.clients.size === 0) rooms.delete(lobbyId);
@@ -466,4 +538,4 @@ wss.on("connection", (ws) => {
     });
 });
 
-server.listen(PORT, () => console.log(`[CollabSync Merged] :${PORT} (public=${PUBLIC_URL || "auto"})`));
+restorePersistentState().then(() => server.listen(PORT, () => console.log(`[CollabSync Merged] :${PORT} (public=${PUBLIC_URL || "auto"})`))).catch(err => { console.error("[Persistence] startup failed:", err); process.exit(1); });
