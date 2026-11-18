@@ -167,7 +167,7 @@ app.get("/api/lobby/list", (req, res) => {
     const list = [];
     for (const l of lobbies.values()) {
         if (l.isPrivate) continue;
-        if (t - l.lastPing > HEARTBEAT_TIMEOUT_MS) continue;
+        if (!l.persistent && t - l.lastPing > HEARTBEAT_TIMEOUT_MS) continue;
         list.push({
             id: l.id, name: l.name, hostName: l.hostName, hostId: l.hostId,
             hasPassword: !!l.passwordHash, placeName: l.placeName, placeId: l.placeId,
@@ -516,6 +516,7 @@ wss.on("connection", (ws) => {
         if (msg.type === "leave") {
             const wasHost = clientInfo && clientInfo.isHost;
             room.clients.delete(ws);
+            if (wasHost && lobbies.get(lobbyId)?.persistent) broadcast(room, { type: "host_left" });
             if (wasHost && !lobbies.get(lobbyId)?.persistent) {
                 broadcast(room, { type: "host_left" });
                 setTimeout(() => {
@@ -537,6 +538,7 @@ wss.on("connection", (ws) => {
         const info = room.clients.get(ws);
         const wasHost = info && info.isHost;
         room.clients.delete(ws);
+        if (wasHost && lobbies.get(lobbyId)?.persistent) broadcast(room, { type: "host_left" });
         if (wasHost && room.clients.size > 0 && !lobbies.get(lobbyId)?.persistent) {
             broadcast(room, { type: "host_left" });
             setTimeout(() => {
