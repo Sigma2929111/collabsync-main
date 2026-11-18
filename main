@@ -1984,78 +1984,133 @@ InPlace = I("Frame", {Name="InPlaceFrame", Size=UDim2.fromOffset(860,600), Posit
 showReviewPrompt = function(snapshotItems, historyItems)
     if State.reviewPrompt or not State.session or not State.session.isHost or not State.session.persistent then return end
     State.reviewPrompt = true
-    local summary = {}
-    local byUser = {}
-    for _, delta in ipairs(historyItems or {}) do
-        local kind = tostring(delta.kind or "change")
-        summary[kind] = (summary[kind] or 0) + 1
-        local who = tostring(delta.userName or delta.userId or "Участник")
-        byUser[who] = (byUser[who] or 0) + 1
+    historyItems = type(historyItems) == "table" and historyItems or {}
+    snapshotItems = type(snapshotItems) == "table" and snapshotItems or {}
+
+    local localSnapshot = buildSnapshot()
+    local localById = {}
+    for _, item in ipairs(localSnapshot) do
+        if type(item) == "table" and type(item.id) == "string" then localById[item.id] = item end
     end
-    local parts = {}
-    for kind, count in pairs(summary) do table.insert(parts, kind..": "..count) end
-    table.sort(parts)
-    local people = {}
-    for who, count in pairs(byUser) do table.insert(people, who.." ("..count..")") end
-    table.sort(people)
-    local details = {}
-    for index, delta in ipairs(historyItems or {}) do
-        if index > 10 then break end
-        local changed = {}
-        if type(delta.props) == "table" then
-            for key in pairs(delta.props) do table.insert(changed, tostring(key)) end
-            table.sort(changed)
+    local reviewDeltas = {}
+    for _, delta in ipairs(historyItems) do
+        if type(delta) == "table" and (delta.kind == "create" or delta.kind == "update" or delta.kind == "delete") then
+            table.insert(reviewDeltas, delta)
         end
-        local objectLabel = tostring(delta.name or delta.id or "объект")
-        local suffix = #changed > 0 and (" ["..table.concat(changed, ", ", 1, math.min(#changed, 4)).."]") or ""
-        table.insert(details, tostring(delta.userName or delta.userId or "Участник").." · "..tostring(delta.kind or "изменение").." · "..objectLabel..suffix)
     end
-    local description = "Сервер хранит "..tostring(#(snapshotItems or {})).." объектов и "..tostring(#(historyItems or {})).." изменений.\n"
-        .. (#parts > 0 and table.concat(parts, " · ") or "Новых событий нет") .. "\n"
-        .. (#people > 0 and table.concat(people, ", ") or "Нет участников в журнале")
-        .. (#details > 0 and ("\n\n"..table.concat(details, "\n")) or "")
+    local function shortValue(value)
+        if value == nil then return "—" end
+        local ok, encoded = pcall(function() return HttpService:JSONEncode(value) end)
+        local textValue = ok and encoded or tostring(value)
+        if #textValue > 64 then textValue = string.sub(textValue, 1, 61) .. "..." end
+        return textValue
+    end
+    local function describeDelta(delta)
+        local name = tostring(delta.name or (localById[delta.id] and localById[delta.id].name) or delta.id or "объект")
+        if delta.kind == "create" then return "Создание · "..name end
+        if delta.kind == "delete" then return "Удаление · "..name end
+        local localItem = localById[delta.id]
+        local changes = {}
+        for key, value in pairs(type(delta.props) == "table" and delta.props or {}) do
+            local before = localItem and localItem.props and localItem.props[key] or nil
+            if shortValue(before) ~= shortValue(value) then
+                table.insert(changes, tostring(key)..": "..shortValue(before).." → "..shortValue(value))
+            end
+        end
+        table.sort(changes)
+        if #changes == 0 then return "Изменение · "..name.." (поля не удалось сравнить)" end
+        return "Изменение · "..name.." — "..table.concat(changes, "; ", 1, math.min(#changes, 3))
+    end
+
+    local selected = {}
+    for index = 1, #reviewDeltas do selected[index] = true end
+    local selectedCount = #reviewDeltas
     local overlay = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=0.45, BorderSizePixel=0, ZIndex=300}, root)
-    local dialog = I("Frame", {Size=UDim2.fromOffset(500,310), Position=UDim2.fromScale(0.5,0.5), AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=T.surface, BorderSizePixel=0, ZIndex=301}, overlay)
+    local dialog = I("Frame", {Size=UDim2.fromOffset(650,470), Position=UDim2.fromScale(0.5,0.5), AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=T.surface, BorderSizePixel=0, ZIndex=301}, overlay)
     round(dialog, 14); outline(dialog, T.border, 1)
-    lbl(dialog, "Изменения, пока вас не было", {font=Enum.Font.GothamBold, textSize=18, size=UDim2.new(1,-40,0,28), pos=UDim2.fromOffset(20,18), zIndex=302})
-    lbl(dialog, description, {textSize=12, color=T.muted, wrapped=true, size=UDim2.new(1,-40,0,150), pos=UDim2.fromOffset(20,58), zIndex=302})
-    lbl(dialog, "Принять — применить серверную версию и новые изменения. Отклонить — оставить вашу текущую сцену и заменить серверную версию ею.", {textSize=11, color=T.text, wrapped=true, size=UDim2.new(1,-40,0,34), pos=UDim2.fromOffset(20,208), zIndex=302})
-    local accept = btn(dialog, "Принять изменения", {size=UDim2.fromOffset(220,38), pos=UDim2.fromOffset(20,250), bg=T.accent, hoverBg=T.accent2, textSize=12, zIndex=303})
-    local reject = btn(dialog, "Отклонить и оставить мою версию", {size=UDim2.new(1,-260,0,38), pos=UDim2.fromOffset(250,250), bg=T.surf2, hoverBg=T.danger, textSize=11, zIndex=303})
+    lbl(dialog, "Ревью изменений рабочего пространства", {font=Enum.Font.GothamBold, textSize=18, size=UDim2.new(1,-40,0,28), pos=UDim2.fromOffset(20,16), zIndex=302})
+    lbl(dialog, "Найдено "..tostring(#reviewDeltas).." изменений. Отметьте, какие операции применить к вашей текущей сцене. Для каждого свойства показано локальное и серверное значение.", {textSize=11, color=T.muted, wrapped=true, size=UDim2.new(1,-40,0,38), pos=UDim2.fromOffset(20,48), zIndex=302})
+    local countLabel = lbl(dialog, "Выбрано: "..tostring(selectedCount).."/"..tostring(#reviewDeltas), {textSize=11, color=T.accent2, size=UDim2.fromOffset(180,22), pos=UDim2.fromOffset(20,88), zIndex=302})
+    local allBtn = btn(dialog, "Выбрать все", {size=UDim2.fromOffset(110,26), pos=UDim2.new(1,-250,0,86), bg=T.surf2, hoverBg=T.border, textSize=10, zIndex=303})
+    local noneBtn = btn(dialog, "Снять выбор", {size=UDim2.fromOffset(110,26), pos=UDim2.new(1,-130,0,86), bg=T.surf2, hoverBg=T.border, textSize=10, zIndex=303})
+    local list = I("ScrollingFrame", {Size=UDim2.new(1,-40,1,-174), Position=UDim2.fromOffset(20,118), BackgroundColor3=T.bg, BorderSizePixel=0, ScrollBarThickness=6, CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y, ZIndex=302}, dialog)
+    round(list, 8); pad(list, 8)
+    I("UIListLayout", {Padding=UDim.new(0,6), SortOrder=Enum.SortOrder.LayoutOrder}, list)
+    local rowChecks = {}
+    local function updateCount()
+        selectedCount = 0
+        for index = 1, #reviewDeltas do if selected[index] then selectedCount += 1 end end
+        countLabel.Text = "Выбрано: "..tostring(selectedCount).."/"..tostring(#reviewDeltas)
+        for index, check in ipairs(rowChecks) do check.Text = selected[index] and "✓" or "□" end
+    end
+    for index, delta in ipairs(reviewDeltas) do
+        local row = I("Frame", {Size=UDim2.new(1,-4,0,58), BackgroundColor3=T.surface, BorderSizePixel=0, LayoutOrder=index, ZIndex=303}, list)
+        round(row, 7)
+        local check = btn(row, "✓", {size=UDim2.fromOffset(34,34), pos=UDim2.fromOffset(8,12), bg=T.success, hoverBg=T.accent, textSize=14, zIndex=304})
+        rowChecks[index] = check
+        check.MouseButton1Click:Connect(function()
+            selected[index] = not selected[index]
+            check.Text = selected[index] and "✓" or "□"
+            check.BackgroundColor3 = selected[index] and T.success or T.surf3
+            updateCount()
+        end)
+        lbl(row, describeDelta(delta), {textSize=10, color=T.text, wrapped=true, size=UDim2.new(1,-58,1,-8), pos=UDim2.fromOffset(50,4), zIndex=304})
+    end
+    if #reviewDeltas == 0 then
+        lbl(list, "Новых изменений для выборочного применения нет. При принятии будет использован серверный snapshot только если локальная сцена пуста.", {textSize=11, color=T.muted, wrapped=true, size=UDim2.new(1,-20,0,48), pos=UDim2.fromOffset(8,8), zIndex=304})
+    end
+    allBtn.MouseButton1Click:Connect(function()
+        for index = 1, #reviewDeltas do selected[index] = true end
+        updateCount()
+    end)
+    noneBtn.MouseButton1Click:Connect(function()
+        for index = 1, #reviewDeltas do selected[index] = false end
+        updateCount()
+    end)
+    local accept = btn(dialog, "Применить выбранное", {size=UDim2.fromOffset(210,36), pos=UDim2.fromOffset(20,426), bg=T.accent, hoverBg=T.accent2, textSize=11, zIndex=303})
+    local reject = btn(dialog, "Отклонить всё и оставить мою сцену", {size=UDim2.new(1,-250,0,36), pos=UDim2.fromOffset(240,426), bg=T.surf2, hoverBg=T.danger, textSize=11, zIndex=303})
     local busy = false
+    local function compactLocalScene(successMessage)
+        task.spawn(function()
+            task.wait(0.5)
+            if State.wsClient and State.connected then
+                local compacted = buildSnapshot()
+                local sent = pcall(function() State.wsClient:Send(HttpService:JSONEncode({type="snapshot", data=compacted})) end)
+                if sent then logMsg("lobby", "success", successMessage) end
+            end
+            State.pendingReviewSnapshot = nil
+            State.pendingReviewHistory = nil
+            State.reviewPrompt = false
+        end)
+    end
     accept.MouseButton1Click:Connect(function()
         if busy then return end
-        busy = true; accept.Text = "Применение..."; reject.Active = false
+        busy = true
+        accept.Text = "Применение..."
+        reject.Active = false
         overlay:Destroy()
-        local function applyHistoryAndCompact()
+        local function applySelected()
             task.spawn(function()
-                for _, delta in ipairs(historyItems or {}) do
-                    if delta.kind ~= "camera" then applyDelta(delta) end
+                for index, delta in ipairs(reviewDeltas) do
+                    if selected[index] then
+                        pcall(function() applyDelta(delta) end)
+                    end
+                    if index % APPLY_CHUNK == 0 then task.wait(APPLY_CHUNK_DELAY) end
                 end
-                task.wait(0.6)
-                if State.wsClient and State.connected then
-                    local compacted = buildSnapshot()
-                    local sent = pcall(function() State.wsClient:Send(HttpService:JSONEncode({type="snapshot", data=compacted})) end)
-                    if sent then logMsg("lobby", "success", "Изменения приняты; серверный snapshot обновлён") end
-                end
-                State.pendingReviewSnapshot = nil; State.pendingReviewHistory = nil; State.reviewPrompt = false
+                compactLocalScene("Выбранные изменения применены; серверный snapshot обновлён")
             end)
         end
-        if snapshotItems and #snapshotItems > 0 then applySnapshotItems(snapshotItems, applyHistoryAndCompact)
-        else applyHistoryAndCompact() end
+        if #localSnapshot == 0 and #snapshotItems > 0 then
+            applySnapshotItems(snapshotItems, applySelected)
+        else
+            applySelected()
+        end
     end)
     reject.MouseButton1Click:Connect(function()
         if busy then return end
         busy = true
         overlay:Destroy()
-        task.spawn(function()
-            local localSnapshot = buildSnapshot()
-            if State.wsClient and State.connected then
-                local sent = pcall(function() State.wsClient:Send(HttpService:JSONEncode({type="snapshot", data=localSnapshot})) end)
-                if sent then logMsg("lobby", "warn", "Серверные изменения отклонены; сохранена локальная версия") end
-            end
-            State.pendingReviewSnapshot = nil; State.pendingReviewHistory = nil; State.reviewPrompt = false
-        end)
+        compactLocalScene("Серверные изменения отклонены; сохранена локальная версия")
     end)
 end
 round(InPlace, 14); outline(InPlace, T.border, 1)
