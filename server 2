@@ -111,7 +111,7 @@ async function sendSnapshotChunks(ws, room) {
 }
 
 // Защита от фантомных лобби: проверка хоста каждые 10 секунд
-setInterval(() => {
+const cleanupTimer = setInterval(() => {
     const now = Date.now();
     for (const [lobbyId, room] of rooms.entries()) {
         if (room.hostUserId && !room.persistent) {
@@ -355,19 +355,21 @@ wss.on("connection", (ws) => {
     });
 });
 
-setInterval(() => {
+const healthTimer = setInterval(() => {
     const url = HOST_PUBLIC_URL ? HOST_PUBLIC_URL + "/health" : `http://localhost:${PORT}/health`;
     fetch(url).catch(()=>{});
 }, 10000);
 
 async function shutdown(signal) {
     console.log(`[Shutdown] ${signal}: flushing persistent rooms...`);
+    clearInterval(cleanupTimer);
+    clearInterval(healthTimer);
     try { await flushPersistentRooms(); }
     catch (e) { console.error("[Shutdown] persistence flush failed:", e.message); process.exitCode = 1; }
     for (const ws of wss.clients) { try { ws.close(1001, "server shutting down"); } catch (_) {} }
     wss.close();
     server.close(() => process.exit(process.exitCode || 0));
-    setTimeout(() => process.exit(1), 10000).unref();
+    setTimeout(() => { server.closeAllConnections?.(); process.exit(process.exitCode || 0); }, 1500).unref();
 }
 process.once("SIGINT", () => shutdown("SIGINT"));
 process.once("SIGTERM", () => shutdown("SIGTERM"));
