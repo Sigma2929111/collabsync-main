@@ -380,7 +380,7 @@ wss.on("connection", (ws) => {
         }
 
         if (msg.type === "lock_request") {
-            if (!clientInfo || clientInfo.isTester || typeof msg.objectId !== "string" || !msg.objectId || msg.objectId.length > 128) return;
+            if (!clientInfo || clientInfo.isTester || (!clientInfo.isHost && !["edit","delete","move","add"].some(key => clientInfo.permissions?.[key] === true)) || typeof msg.objectId !== "string" || !msg.objectId || msg.objectId.length > 128) return;
             if (!room.locks) room.locks = new Map();
             const objectId = msg.objectId;
             const current = room.locks.get(objectId);
