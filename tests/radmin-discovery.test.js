@@ -245,13 +245,13 @@ test("Server 1 and Server 2 support a real two-client collaboration session", as
         await lockConflict;
         const blockedByLock = waitForMessage(hostSocket, message => message.type === "delta" && message.id === "locked-edit", 250)
             .then(() => true, () => false);
-        guestSocket.send(JSON.stringify({type:"delta", id:"locked-edit", kind:"update", props:{Name:"must not pass lock"}}));
+        guestSocket.send(JSON.stringify({type:"delta", id:"locked-edit", objectId:"locked-edit", kind:"update", props:{Name:"must not pass lock"}}));
         assert.equal(await blockedByLock, false, "server must reject edits while another participant holds the object lock");
         const unlocked = waitForMessage(guestSocket, message => message.type === "lock_state" && message.objectId === "locked-edit" && message.lock === null, 4000, "lock release broadcast");
         hostSocket.send(JSON.stringify({type:"lock_release", objectId:"locked-edit"}));
         await unlocked;
         const afterUnlock = waitForMessage(hostSocket, message => message.type === "delta" && message.id === "locked-edit", 4000, "edit after lock release");
-        guestSocket.send(JSON.stringify({type:"delta", id:"locked-edit", kind:"update", props:{Name:"allowed after unlock"}}));
+        guestSocket.send(JSON.stringify({type:"delta", id:"locked-edit", objectId:"locked-edit", kind:"update", props:{Name:"allowed after unlock"}}));
         assert.equal((await afterUnlock).userId, 120002);
     } finally {
         for (const socket of [hostSocket, guestSocket]) {
