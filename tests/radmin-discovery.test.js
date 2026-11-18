@@ -587,7 +587,9 @@ test("Server 2-in-1 enforces member ACL and object claims", async () => {
         });
         assert.equal(testerJoinResponse.status, 200);
         const testerJoined = await testerJoinResponse.json();
-        testerSocket = (await connectWs(baseUrl, testerJoined.token)).socket;
+        const testerConnection = await connectWs(baseUrl, testerJoined.token);
+        testerSocket = testerConnection.socket;
+        assert.equal(testerConnection.welcome.players.find(p => p.userId === 150003)?.isTester, true, "server must assign tester role from TESTER_IDS");
         const testerEdit = waitForMessage(hostSocket, m => m.type === "delta" && m.id === "tester-edit", 250).then(() => true, () => false);
         const testerEditNotice = waitForMessage(testerSocket, m => m.type === "permission_denied" && m.action === "update", 4000, "tester edit denial notice");
         testerSocket.send(JSON.stringify({type:"delta", id:"tester-edit", kind:"update", props:{Name:"must remain read only"}}));
