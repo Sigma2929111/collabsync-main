@@ -414,6 +414,7 @@ test("split Server 1 + Server 2 persistent workspace survives both service resta
         hostSocket = firstConnection.socket;
         const snapshot = [{id:"split-object", parentId:"service:Workspace", className:"Part", name:"Persisted", props:{Name:"Persisted"}, attrs:{}}];
         hostSocket.send(JSON.stringify({type:"snapshot", data:snapshot}));
+        await new Promise(resolve => setTimeout(resolve, 450));
         const backupHeaders = {"Content-Type":"application/json", "Authorization":"Bearer "+created.token};
         const backupCreateBeforeRestart = await fetch(hostUrl + "/api/workspace/backups/create", {
             method:"POST", headers:backupHeaders, body:JSON.stringify({lobbyId:created.lobbyId}),
