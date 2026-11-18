@@ -1438,7 +1438,21 @@ I("TextButton", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text=""}, 
     confDot.Position = confOn and UDim2.fromOffset(23,3) or UDim2.fromOffset(3,3)
 end)
 
-local publishBtn = btn(Create, "Опубликовать", {size=UDim2.new(1,0,0,44), pos=UDim2.fromOffset(0,340), bg=T.accent, hoverBg=T.accent2, textSize=14})
+local persistentLobbyOn = false
+local persistentRow = I("Frame", {Size=UDim2.new(1,0,0,34), Position=UDim2.fromOffset(0,306), BackgroundColor3=T.surface, BorderSizePixel=0}, Create)
+round(persistentRow, 8); outline(persistentRow, T.border, 1)
+lbl(persistentRow, "Долгосрочное лобби (сохраняется после выхода всех)", {textSize=12, size=UDim2.new(1,-70,1,0), pos=UDim2.fromOffset(12,0)})
+local persistentToggle = I("Frame", {Size=UDim2.fromOffset(42,22), Position=UDim2.new(1,-54,0.5,-11), BackgroundColor3=T.surf3, BorderSizePixel=0}, persistentRow)
+round(persistentToggle, 11)
+local persistentDot = I("Frame", {Size=UDim2.fromOffset(16,16), Position=UDim2.fromOffset(3,3), BackgroundColor3=T.text, BorderSizePixel=0}, persistentToggle)
+round(persistentDot, 8)
+I("TextButton", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text="", ZIndex=5}, persistentToggle).MouseButton1Click:Connect(function()
+    persistentLobbyOn = not persistentLobbyOn
+    persistentToggle.BackgroundColor3 = persistentLobbyOn and T.accent or T.surf3
+    persistentDot.Position = persistentLobbyOn and UDim2.fromOffset(23,3) or UDim2.fromOffset(3,3)
+end)
+
+local publishBtn = btn(Create, "Опубликовать", {size=UDim2.new(1,0,0,44), pos=UDim2.fromOffset(0,350), bg=T.accent, hoverBg=T.accent2, textSize=14})
 
 -- Direct tab (Radmin / LAN)
 local Direct = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Visible=false}, Content)
@@ -2383,7 +2397,8 @@ publishLobby = function()
         isPrivate = confOn,
         hostUrl = hostUrl,
         placeId = game.PlaceId,
-        placeName = game.Name
+        placeName = game.Name,
+        persistent = persistentLobbyOn
     })
     
     if ok and res and res.lobbyId and res.token then
