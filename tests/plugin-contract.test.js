@@ -35,3 +35,7 @@ test("plugin exposes chat camera and selection permission controls", () => {
     assert.match(pluginSource, /chat=selected\[5\], camera=selected\[6\], select=selected\[7\]/);
     assert.match(pluginSource, /permissions\.chat == true, permissions\.camera == true, permissions\.select == true/);
 });
+test("plugin displays server-side permission denial feedback", () => {
+    assert.match(pluginSource, /data\.type == "permission_denied"/);
+    assert.match(pluginSource, /Недостаточно прав/);
+});
