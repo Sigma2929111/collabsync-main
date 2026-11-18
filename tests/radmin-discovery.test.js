@@ -222,10 +222,14 @@ test("Server 1 and Server 2 support a real two-client collaboration session", as
         await denyUpdate;
         const deniedDelta = waitForMessage(hostSocket, message => message.type === "delta" && message.id === "acl-denied", 300)
             .then(() => true, () => false);
+        const deniedNotice = waitForMessage(guestSocket, message => message.type === "permission_denied" && message.action === "update", 4000, "edit permission denial notice");
         guestSocket.send(JSON.stringify({type:"delta", id:"acl-denied", kind:"update", props:{Name:"blocked"}}));
+        await deniedNotice;
         assert.equal(await deniedDelta, false, "server must reject an update without edit permission");
         const readOnlyLock = waitForMessage(hostSocket, message => message.type === "lock_state" && message.objectId === "read-only-lock", 250).then(() => true, () => false);
+        const readOnlyLockNotice = waitForMessage(guestSocket, message => message.type === "permission_denied" && message.action === "lock", 4000, "read-only lock denial notice");
         guestSocket.send(JSON.stringify({type:"lock_request", objectId:"read-only-lock"}));
+        await readOnlyLockNotice;
         assert.equal(await readOnlyLock, false, "a participant with no mutation permissions must not lock objects");
 
         const allowUpdate = waitForMessage(guestSocket, message =>
@@ -624,13 +628,19 @@ test("Server 2-in-1 enforces member ACL and object claims", async () => {
         await disablePresence;
         guestSocket.send(JSON.stringify({type:"permissions_update", targetUserId:150002, permissions:{edit:true, delete:true, move:true, add:true, chat:true, camera:true, select:true}}));
         const blockedChat = waitForMessage(hostSocket, m => m.type === "chat" && m.userId === 150002, 250).then(() => true, () => false);
+        const chatDeniedNotice = waitForMessage(guestSocket, m => m.type === "permission_denied" && m.action === "chat", 4000, "chat permission denial notice");
         guestSocket.send(JSON.stringify({type:"chat", text:"must not be delivered"}));
+        await chatDeniedNotice;
         assert.equal(await blockedChat, false, "server must enforce chat permission");
         const blockedCamera = waitForMessage(hostSocket, m => m.type === "delta" && m.kind === "camera", 250).then(() => true, () => false);
+        const cameraDeniedNotice = waitForMessage(guestSocket, m => m.type === "permission_denied" && m.action === "camera", 4000, "camera permission denial notice");
         guestSocket.send(JSON.stringify({type:"delta", id:"camera-disabled", kind:"camera", cframe:Array(12).fill(0)}));
+        await cameraDeniedNotice;
         assert.equal(await blockedCamera, false, "server must enforce camera permission");
         const blockedSelection = waitForMessage(hostSocket, m => m.type === "delta" && m.kind === "select" && m.id === "selection-disabled", 250).then(() => true, () => false);
+        const selectionDeniedNotice = waitForMessage(guestSocket, m => m.type === "permission_denied" && m.action === "select", 4000, "selection permission denial notice");
         guestSocket.send(JSON.stringify({type:"delta", id:"selection-disabled", kind:"select", active:true}));
+        await selectionDeniedNotice;
         assert.equal(await blockedSelection, false, "server must enforce selection permission");
 
         const restorePresence = waitForMessage(guestSocket, m => m.type === "players" && m.players.some(p => p.userId === 150002 && p.permissions?.chat === true && p.permissions?.camera === true && p.permissions?.select === true), 4000, "restore chat and presence");
