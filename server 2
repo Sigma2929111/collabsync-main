@@ -201,6 +201,15 @@ async function sendSnapshotChunks(ws, room) {
 const cleanupTimer = setInterval(() => {
     const now = Date.now();
     for (const [lobbyId, room] of rooms.entries()) {
+
+        if (room.locks) {
+            for (const [objectId, lock] of room.locks.entries()) {
+                if (lock.expiresAt <= now) {
+                    room.locks.delete(objectId);
+                    broadcast(room, {type:"lock_state", objectId, lock:null});
+                }
+            }
+        }
         if (room.hostUserId && !room.persistent) {
             let hostOnline = false;
             for (const [, info] of room.clients) {
