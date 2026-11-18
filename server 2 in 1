@@ -403,6 +403,10 @@ wss.on("connection", (ws) => {
                 if (typeof decoded.lobbyId !== "string" || !decoded.lobbyId || !Number.isSafeInteger(Number(decoded.userId)) || Number(decoded.userId) <= 0) {
                     throw new Error("invalid token claims");
                 }
+                const tokenLobby = lobbies.get(decoded.lobbyId);
+                if (!tokenLobby) throw new Error("lobby no longer exists");
+                const tokenUserIsHost = Number(decoded.userId) === Number(tokenLobby.hostId);
+                if ((decoded.isHost === true) !== tokenUserIsHost) throw new Error("token role does not match lobby owner");
                 lobbyId    = decoded.lobbyId;
                 myUserId   = Number(decoded.userId);
                 myUserName = String(decoded.userName || myUserId).slice(0, 32);
