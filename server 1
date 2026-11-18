@@ -147,12 +147,19 @@ app.post("/api/lobby/join", async (req, res) => {
         return res.status(410).json({ error: "lobby expired" });
     }
     
-    // JWT для гостя строго содержит isHost: false
-    const token = jwt.sign({ 
-        lobbyId, userId: uid, userName: safeName, isHost: false, isTester: roles.isTester, lobbyName: lobby.name, persistent: lobby.persistent === true 
+    // Только исходный владелец лобби может повторно получить host-токен.
+    const joiningAsHost = uid === lobby.hostId;
+    const token = jwt.sign({
+        lobbyId, userId: uid, userName: safeName,
+        isHost: joiningAsHost, isTester: joiningAsHost ? false : roles.isTester,
+        lobbyName: lobby.name, persistent: lobby.persistent === true
     }, JWT_SECRET, { expiresIn: "12h" });
-    
-    res.json({ token, hostUrl: lobby.hostUrl, lobbyId, lobbyName: lobby.name, hostName: lobby.hostName });
+
+    res.json({
+        token, hostUrl: lobby.hostUrl, lobbyId, lobbyName: lobby.name,
+        hostName: lobby.hostName, hostId: lobby.hostId,
+        isHost: joiningAsHost, persistent: lobby.persistent === true
+    });
 });
 
 app.get("/api/lobby/list", (req, res) => {
