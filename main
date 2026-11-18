@@ -2011,6 +2011,18 @@ showReviewPrompt = function(snapshotItems, historyItems)
         if delta.kind == "delete" then return "Удаление · "..name end
         local localItem = localById[delta.id]
         local changes = {}
+        if delta.name ~= nil then
+            local beforeName = localItem and localItem.name or nil
+            if shortValue(beforeName) ~= shortValue(delta.name) then
+                table.insert(changes, "Имя: "..shortValue(beforeName).." → "..shortValue(delta.name))
+            end
+        end
+        if delta.parentId ~= nil then
+            local beforeParent = localItem and localItem.parentId or nil
+            if shortValue(beforeParent) ~= shortValue(delta.parentId) then
+                table.insert(changes, "Родитель: "..shortValue(beforeParent).." → "..shortValue(delta.parentId))
+            end
+        end
         for key, value in pairs(type(delta.props) == "table" and delta.props or {}) do
             local before = nil
             if localItem and type(localItem.props) == "table" then before = localItem.props[key] end
@@ -2018,9 +2030,18 @@ showReviewPrompt = function(snapshotItems, historyItems)
                 table.insert(changes, tostring(key)..": "..shortValue(before).." → "..shortValue(value))
             end
         end
+        for key, value in pairs(type(delta.attrs) == "table" and delta.attrs or {}) do
+            local before = nil
+            if localItem and type(localItem.attrs) == "table" then before = localItem.attrs[key] end
+            if shortValue(before) ~= shortValue(value) then
+                table.insert(changes, "Атрибут "..tostring(key)..": "..shortValue(before).." → "..shortValue(value))
+            end
+        end
         table.sort(changes)
         if #changes == 0 then return "Изменение · "..name.." (поля не удалось сравнить)" end
-        return "Изменение · "..name.." — "..table.concat(changes, "; ", 1, math.min(#changes, 3))
+        local summary = table.concat(changes, "; ", 1, math.min(#changes, 3))
+        if #changes > 3 then summary = summary.." (+"..tostring(#changes - 3).." полей)" end
+        return "Изменение · "..name.." — "..summary
     end
 
     local selected = {}
