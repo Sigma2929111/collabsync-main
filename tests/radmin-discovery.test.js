@@ -243,15 +243,15 @@ test("Server 1 and Server 2 support a real two-client collaboration session", as
         const lockConflict = waitForMessage(guestSocket, message => message.type === "lock_conflict" && message.objectId === "locked-edit", 4000, "guest lock conflict");
         guestSocket.send(JSON.stringify({type:"lock_request", objectId:"locked-edit"}));
         await lockConflict;
-        const blockedByLock = waitForMessage(hostSocket, message => message.type === "delta" && message.id === "locked-edit", 250)
+        const blockedByLock = waitForMessage(hostSocket, message => message.type === "delta" && message.id === "locked-object", 250)
             .then(() => true, () => false);
-        guestSocket.send(JSON.stringify({type:"delta", id:"locked-edit", kind:"update", props:{Name:"must not pass lock"}}));
+        guestSocket.send(JSON.stringify({type:"delta", id:"locked-object", kind:"update", props:{Name:"must not pass lock"}}));
         assert.equal(await blockedByLock, false, "server must reject edits while another participant holds the object lock");
         const unlocked = waitForMessage(guestSocket, message => message.type === "lock_state" && message.objectId === "locked-edit" && message.lock === null, 4000, "lock release broadcast");
         hostSocket.send(JSON.stringify({type:"lock_release", objectId:"locked-edit"}));
         await unlocked;
-        const afterUnlock = waitForMessage(hostSocket, message => message.type === "delta" && message.id === "unlocked-edit", 4000, "edit after lock release");
-        guestSocket.send(JSON.stringify({type:"delta", id:"unlocked-edit", kind:"update", props:{Name:"allowed after unlock"}}));
+        const afterUnlock = waitForMessage(hostSocket, message => message.type === "delta" && message.id === "locked-object", 4000, "edit after lock release");
+        guestSocket.send(JSON.stringify({type:"delta", id:"locked-object", kind:"update", props:{Name:"allowed after unlock"}}));
         assert.equal((await afterUnlock).userId, 120002);
     } finally {
         for (const socket of [hostSocket, guestSocket]) {
