@@ -91,7 +91,7 @@ setInterval(() => {
 }, 10000);
 
 wss.on("connection", (ws) => {
-    let lobbyId=null, myUserId=null, myUserName=null, myIsHost=false;
+    let lobbyId=null, myUserId=null, myUserName=null, myIsHost=false, myIsTester=false;
     
     ws.on("message", (raw) => {
         let msg;
