@@ -1,0 +1,23 @@
+{
+  "name": "collabsync-server",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Node.js services for CollabSync Roblox Studio collaboration",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start:catalog": "node \"server 1\"",
+    "start:host": "node \"server 2\"",
+    "start:combined": "node \"server 2 in 1\"",
+    "check": "node --check \"server 1\" && node --check \"server 2\" && node --check \"server 2 in 1\""
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "ws": "^8.18.0"
+  }
+}
