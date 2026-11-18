@@ -38,7 +38,7 @@ async function flushPersistentState() {
     const ids = new Set(keep.map(l => l.id));
     const state = { version: 1, lobbies: keep, rooms: [...rooms.entries()].filter(([id]) => ids.has(id)).map(([id, r]) => [id, { snapshot: r.snapshot, history: r.history, hostUserId: r.hostUserId, lastHostPing: r.lastHostPing }]) };
     const data = JSON.stringify(state);
-    persistQueue = persistQueue.then(async () => {
+    persistQueue = persistQueue.catch(() => {}).then(async () => {
         await fs.promises.mkdir(DATA_DIR, { recursive: true });
         const tmp = STATE_FILE + ".tmp";
         await fs.promises.writeFile(tmp, data, { mode: 0o600 });
