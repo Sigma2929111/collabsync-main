@@ -378,6 +378,8 @@ test("split Server 1 + Server 2 persistent workspace survives both service resta
         });
         assert.equal(ownerJoinResponse.status, 200);
         const ownerJoin = await ownerJoinResponse.json();
+        assert.equal(ownerJoin.isHost, true);
+        assert.equal(ownerJoin.persistent, true);
         const ownerConnection = await connectWs(hostUrl, ownerJoin.token);
         hostSocket = ownerConnection.socket;
         assert.equal(ownerConnection.welcome.snapshotSize, 1);
