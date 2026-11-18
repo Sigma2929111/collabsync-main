@@ -1,6 +1,6 @@
 "use strict";
 
-const DEFAULT_PERMISSIONS = Object.freeze({ edit: true, delete: true, move: true, add: true });
+const DEFAULT_PERMISSIONS = Object.freeze({ edit: true, delete: true, move: true, add: true, chat: true, camera: true, select: true });
 
 function normalizePermissions(input, fallback = DEFAULT_PERMISSIONS) {
     const source = input && typeof input === "object" && !Array.isArray(input) ? input : {};
