@@ -243,6 +243,10 @@ test("Server 1 and Server 2 support a real two-client collaboration session", as
         const lockConflict = waitForMessage(guestSocket, message => message.type === "lock_conflict" && message.objectId === "locked-edit", 4000, "guest lock conflict");
         guestSocket.send(JSON.stringify({type:"lock_request", objectId:"locked-edit"}));
         await lockConflict;
+        const spoofedLockBypass = waitForMessage(hostSocket, message => message.type === "delta" && message.id === "locked-edit", 250)
+            .then(() => true, () => false);
+        guestSocket.send(JSON.stringify({type:"delta", id:"locked-edit", objectId:"unlocked-spoof", kind:"update", props:{Name:"must not bypass lock"}}));
+        assert.equal(await spoofedLockBypass, false, "server must derive lock target from the actual delta id, not a client-supplied alias");
         const blockedByLock = waitForMessage(hostSocket, message => message.type === "delta" && message.id === "locked-edit", 250)
             .then(() => true, () => false);
         guestSocket.send(JSON.stringify({type:"delta", id:"locked-edit", objectId:"locked-edit", kind:"update", props:{Name:"must not pass lock"}}));
