@@ -93,19 +93,33 @@ test("Server 2-in-1 exposes loopback-only Radmin discovery", async () => {
 
 function waitForMessage(socket, predicate, timeoutMs = 4000, label = "matching message") {
     return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
+        const cleanup = () => {
+            clearTimeout(timer);
             socket.off("message", onMessage);
+            socket.off("close", onClose);
+        };
+        const timer = setTimeout(() => {
+            cleanup();
             reject(new Error("WebSocket message timeout: " + label));
         }, timeoutMs);
+        function onClose() {
+            cleanup();
+            reject(new Error("WebSocket closed before " + label));
+        }
         function onMessage(raw) {
             let message;
             try { message = JSON.parse(raw.toString()); } catch (_) { return; }
+            if (message && message.type === "error") {
+                cleanup();
+                reject(new Error("Server rejected " + label + ": " + String(message.message || "unknown error")));
+                return;
+            }
             if (!predicate(message)) return;
-            clearTimeout(timer);
-            socket.off("message", onMessage);
+            cleanup();
             resolve(message);
         }
         socket.on("message", onMessage);
+        socket.once("close", onClose);
     });
 }
 
