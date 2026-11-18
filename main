@@ -1946,10 +1946,12 @@ local ciBox = I("TextBox", {Size=UDim2.new(1,-92,1,-12), Position=UDim2.fromOffs
 local sendBtn = btn(chatInput, "➤", {size=UDim2.fromOffset(72,28), pos=UDim2.new(1,-82,0.5,-14), bg=T.accent, hoverBg=T.accent2, textSize=14})
 
 local function sendChat()
-    local txt = ciBox.Text
-    if txt == "" or not State.connected then return end
-    State.wsClient:Send(HttpService:JSONEncode({type="chat", text=txt, userId=MY_ID, userName=MY_NAME}))
-    ciBox.Text = ""
+    local txt = tostring(ciBox.Text or ""):gsub("%c", ""):gsub("^%s+", ""):gsub("%s+$", ""):sub(1, 1000)
+    if txt == "" or not State.connected or not State.wsClient then return end
+    local ok = pcall(function()
+        State.wsClient:Send(HttpService:JSONEncode({type="chat", text=txt, userId=MY_ID, userName=MY_NAME}))
+    end)
+    if ok then ciBox.Text = "" end
 end
 sendBtn.MouseButton1Click:Connect(sendChat)
 ciBox.FocusLost:Connect(function(enter) if enter then sendChat() end end)
@@ -2115,8 +2117,16 @@ connectWebSocket = function(hostUrl, token, isHost, onReady, onFail, isReconnect
             applyDelta(data)
             
         elseif data.type == "chat" then
-            addMessageToUI(data.userId, data.userName, data.text)
-            logMsg("lobby", "info", "Чат: "..data.userName..": "..data.text)
+            local chatText = tostring(data.text or ""):sub(1, 1000)
+            addMessageToUI(data.userId, data.userName, chatText)
+            logMsg("lobby", "info", "Чат: "..tostring(data.userName or "Участник")..": "..chatText)
+            if data.userId ~= MY_ID then
+                local lowerText = string.lower(chatText)
+                local lowerName = string.lower(tostring(MY_NAME or ""))
+                if lowerText:find("@all", 1, true) or (lowerName ~= "" and lowerText:find("@"..lowerName, 1, true)) then
+                    if InPlace then showToast(InPlace, "Вас упомянули в чате", T.accent) end
+                end
+            end
             
         elseif data.type == "players" then
             State.remotePlayers = data.players or {}
