@@ -1918,7 +1918,7 @@ local openSettings = function(context)
     sTabPlace.Visible = (currentWhitelistScope ~= nil)
     sTabPerms.Visible = (context == "inplace" and isOwnLobby)
     sTabBlack.Visible = isOwnerRole
-    sTabBackups.Visible = (context == "inplace" and isOwnLobby)
+    sTabBackups.Visible = (context == "inplace" and isOwnLobby and State.session and State.session.persistent == true)
     switchSTab("gui")
 end
 settingsBtn.MouseButton1Click:Connect(function() openSettings("main") end)
@@ -2256,9 +2256,14 @@ connectWebSocket = function(hostUrl, token, isHost, onReady, onFail, isReconnect
             task.defer(function() exitLobbyUI() end)
             
         elseif data.type == "host_left" then
-            logMsg("lobby", "warn", "Хост вышел, лобби закрыто")
-            showToast(InPlace, "Хост вышел", T.danger)
-            task.defer(function() exitLobbyUI() end)
+            if State.session and State.session.persistent then
+                logMsg("lobby", "warn", "Владелец временно не в сети — долгосрочное лобби продолжает работу")
+                showToast(InPlace, "Владелец вышел. Лобби остаётся доступным.", T.accent)
+            else
+                logMsg("lobby", "warn", "Хост вышел, лобби закрыто")
+                showToast(InPlace, "Хост вышел", T.danger)
+                task.defer(function() exitLobbyUI() end)
+            end
             
         elseif data.type == "error" then
             logMsg("lobby", "error", data.message or "server error")
