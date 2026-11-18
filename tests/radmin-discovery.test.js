@@ -543,7 +543,7 @@ test("Server 2-in-1 enforces member ACL and object claims", async () => {
     const port = await freePort();
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "collabsync-combined-acl-"));
     const baseUrl = "http://127.0.0.1:" + port;
-    let server, hostSocket, guestSocket, testerSocket;
+    let server, hostSocket, guestSocket, testerSocket, newcomerSocket;
     try {
         server = await startNodeServer("server 2 in 1", port, dataDir, {TESTER_IDS:"150003"});
         const createResponse = await fetch(baseUrl + "/api/lobby/create", {
@@ -596,6 +596,24 @@ test("Server 2-in-1 enforces member ACL and object claims", async () => {
         const lockState = waitForMessage(guestSocket, m => m.type === "lock_state" && m.objectId === "combined-object" && m.lock?.userId === 150001, 4000, "combined lock state");
         hostSocket.send(JSON.stringify({type:"lock_request", objectId:"combined-object"}));
         await lockState;
+
+        const newcomerJoin = await fetch(baseUrl + "/api/lobby/join", {
+            method:"POST", headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({lobbyId:created.lobbyId, userId:150004, userName:"Late Joiner"}),
+        });
+        assert.equal(newcomerJoin.status, 200);
+        const newcomerToken = await newcomerJoin.json();
+        newcomerSocket = new WebSocket(baseUrl.replace("http:", "ws:") + "/ws");
+        const newcomerWelcome = waitForMessage(newcomerSocket, m => m.type === "welcome", 4000, "late joiner welcome");
+        const newcomerLock = waitForMessage(newcomerSocket, m => m.type === "lock_state" && m.objectId === "combined-object" && m.lock?.userId === 150001, 4000, "late joiner receives active lock");
+        await new Promise((resolve, reject) => {
+            newcomerSocket.once("error", reject);
+            newcomerSocket.once("open", resolve);
+        });
+        newcomerSocket.send(JSON.stringify({type:"hello", token:newcomerToken.token}));
+        await newcomerWelcome;
+        await newcomerLock;
+
         const conflict = waitForMessage(guestSocket, m => m.type === "lock_conflict" && m.objectId === "combined-object", 4000, "combined lock conflict");
         guestSocket.send(JSON.stringify({type:"lock_request", objectId:"combined-object"}));
         await conflict;
@@ -611,7 +629,7 @@ test("Server 2-in-1 enforces member ACL and object claims", async () => {
         await releasedOnDisconnect;
         guestSocket = null;
     } finally {
-        for (const socket of [hostSocket, guestSocket, testerSocket]) {
+        for (const socket of [hostSocket, guestSocket, testerSocket, newcomerSocket]) {
             if (socket && socket.readyState !== WebSocket.CLOSED) socket.close();
         }
         await stopNodeServer(server);
