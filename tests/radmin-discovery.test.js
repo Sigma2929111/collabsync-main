@@ -266,7 +266,7 @@ test("Server 1 and Server 2 support a real two-client collaboration session", as
         for (const candidate of [
             {id:"acl-move-allowed", kind:"update", props:{Position:{x:4,y:5,z:6}}},
             {id:"acl-delete-allowed", kind:"delete"},
-            {id:"acl-create-allowed", kind:"create", className:"Part", parentId:"service:Workspace", props:{Name:"allowed"}},
+            {id:"acl-create-allowed", kind:"create", name:"allowed", className:"Part", parentId:"service:Workspace", props:{Name:"allowed"}},
         ]) {
             const received = waitForMessage(hostSocket, message => message.type === "delta" && message.id === candidate.id, 4000, "permitted "+candidate.kind+" delta");
             guestSocket.send(JSON.stringify({type:"delta", ...candidate}));
