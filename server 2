@@ -166,7 +166,7 @@ wss.on("connection", (ws) => {
             
             const room = getRoom(lobbyId);
             room.persistent = room.persistent || decoded.persistent === true;
-            for (const [oldWs/, info] of room.clients.entries()) {
+            for (const [oldWs, info] of room.clients.entries()) {
                 if (info.userId === myUserId) {
                     try { oldWs.close(); } catch(e) {}
                     room.clients.delete(oldWs);
