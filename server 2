@@ -9,7 +9,8 @@ const HOST_PUBLIC_URL = process.env.HOST_PUBLIC_URL || "";
 
 const CHUNK_SIZE = 200;
 const CHUNK_DELAY_MS = 60;
-const MAX_HISTORY = 8000; // Защита от перегрузки памяти
+const MAX_HISTORY = 8000; // Ограничение истории по числу событий
+const ALLOWED_DELTA_KINDS = new Set(["create", "update", "delete", "select", "camera"]);
 
 const rooms = new Map();
 
@@ -116,7 +117,13 @@ wss.on("connection", (ws) => {
             }
             
             const room = getRoom(lobbyId);
-            
+            for (const [oldWs, info] of room.clients.entries()) {
+                if (info.userId === myUserId) {
+                    try { oldWs.close(); } catch(e) {}
+                    room.clients.delete(oldWs);
+                }
+            }
+
             // Защита: если это не хост, а хост еще не подключился или отключился
             if (!myIsHost) {
                 if (!room.hostUserId) {
@@ -166,7 +173,7 @@ wss.on("connection", (ws) => {
         
         if (msg.type === "snapshot") {
             // Только хост может отправлять полный снапшот
-            if (myIsHost && !myIsTester && Array.isArray(msg.data)) {
+            if (clientInfo && clientInfo.isHost && !clientInfo.isTester && Array.isArray(msg.data)) {
                 room.snapshot = msg.data;
                 room.history = [];
                 console.log(`[Snapshot] ${lobbyId}: ${room.snapshot.length} items`);
@@ -175,23 +182,32 @@ wss.on("connection", (ws) => {
         }
         
         if (msg.type === "delta") {
-            if (!clientInfo || (clientInfo.isTester && msg.kind !== "camera")) return;
-            if (msg.kind !== "camera") { 
-                room.history.push(msg); 
-                if (room.history.length > MAX_HISTORY) room.history.shift(); // Защита от перегрузки
+            if (!clientInfo || !ALLOWED_DELTA_KINDS.has(msg.kind)) return;
+            if (clientInfo.isTester && msg.kind !== "camera") return;
+            if (typeof msg.id !== "string" || msg.id.length > 128) return;
+            if (msg.kind !== "camera" && (typeof msg.id !== "string" || !msg.id)) return;
+            if (msg.kind === "camera" && (!Array.isArray(msg.cframe) || msg.cframe.length !== 12 || !msg.cframe.every(Number.isFinite))) return;
+            if ((msg.kind === "create" || msg.kind === "update") && (!msg.props || typeof msg.props !== "object" || Array.isArray(msg.props))) return;
+            if (msg.kind === "create" && (typeof msg.className !== "string" || typeof msg.name !== "string" || typeof msg.parentId !== "string")) return;
+            const trustedDelta = { ...msg, userId: clientInfo.userId, userName: clientInfo.userName };
+            if (msg.kind !== "camera") {
+                room.history.push(trustedDelta);
+                if (room.history.length > MAX_HISTORY) room.history.shift();
             }
-            broadcast(room, msg, ws);
+            broadcast(room, trustedDelta, ws);
             return;
         }
         
-        if (msg.type === "heartbeat") { 
-            if (myIsHost) room.lastHostPing = Date.now();
+        if (msg.type === "heartbeat") {
+            if (!clientInfo) return;
+            if (clientInfo.isHost) room.lastHostPing = Date.now();
             try { ws.send(JSON.stringify({type:"heartbeat_ack", ts:Date.now()})); } catch(e){} 
             return; 
         }
         
-        if (msg.type === "chat") { 
-            broadcast(room, {type:"chat", userId:myUserId, userName:myUserName, text:String(msg.text||"").slice(0,1000), ts:Date.now()}, null); 
+        if (msg.type === "chat") {
+            if (!clientInfo) return;
+            broadcast(room, {type:"chat", userId:clientInfo.userId, userName:clientInfo.userName, text:String(msg.text||"").slice(0,1000), ts:Date.now()}, null); 
             return; 
         }
         
