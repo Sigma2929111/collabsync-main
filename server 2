@@ -311,6 +311,14 @@ wss.on("connection", (ws) => {
             
             sendSnapshotChunks(ws, room).catch(()=>{});
             sendPlayers(room);
+            // A late joiner must receive the active lock map, not only future lock changes.
+            if (room.locks) {
+                for (const [objectId, lock] of room.locks.entries()) {
+                    if (lock && lock.expiresAt > Date.now()) {
+                        try { ws.send(JSON.stringify({type:"lock_state", objectId, lock})); } catch (_) {}
+                    }
+                }
+            }
             return;
         }
         
