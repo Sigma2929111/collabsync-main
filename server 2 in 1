@@ -18,6 +18,9 @@ const HEARTBEAT_TIMEOUT_MS = 45000;
 const CHUNK_SIZE       = 200;
 const CHUNK_DELAY_MS   = 60;
 const MAX_HISTORY      = 8000;
+const MAX_ROOM_CLIENTS = 32;
+const WS_MESSAGES_PER_10S = 180;
+const CHAT_MESSAGES_PER_10S = 6;
 const ALLOWED_DELTA_KINDS = new Set(["create", "update", "delete", "select", "camera"]);
 
 const TESTER_IDS   = new Set((process.env.TESTER_IDS || "").split(",").map(s=>s.trim()).filter(Boolean));
@@ -32,7 +35,7 @@ function getUserRoles(userId, userName) {
     const idStr = String(userId || "");
     return {
         isTester: TESTER_IDS.has(idStr),
-        isBanned: bannedUsers.has(idStr) || bannedUsers.has(name),
+        isBanned: bannedUsers.has(idStr),
     };
 }
 
@@ -290,8 +293,13 @@ setInterval(() => {
 
 wss.on("connection", (ws) => {
     let lobbyId = null, myUserId = null, myUserName = null, myIsHost = false, myIsTester = false;
+    ws._csRate = { startedAt: now(), count: 0 };
 
     ws.on("message", (raw) => {
+        const rateNow = now();
+        if (rateNow - ws._csRate.startedAt >= 10000) ws._csRate = { startedAt: rateNow, count: 0 };
+        ws._csRate.count++;
+        if (ws._csRate.count > WS_MESSAGES_PER_10S) { try { ws.close(1008, "rate limit"); } catch(e){} return; }
         let msg;
         try { msg = JSON.parse(raw.toString()); } catch(e) { return; }
         if (!msg || typeof msg !== "object") return;
@@ -339,7 +347,12 @@ wss.on("connection", (ws) => {
                 room.lastHostPing = Date.now();
             }
 
-            room.clients.set(ws, { userId: myUserId, userName: myUserName, isHost: myIsHost, isTester: myIsTester, roles: {isTester: myIsTester} });
+            if (room.clients.size >= MAX_ROOM_CLIENTS) {
+                try { ws.send(JSON.stringify({ type: "error", message: "lobby full" })); } catch(e){}
+                try { ws.close(1008, "lobby full"); } catch(e){}
+                return;
+            }
+            room.clients.set(ws, { userId: myUserId, userName: myUserName, isHost: myIsHost, isTester: myIsTester, roles: {isTester: myIsTester}, chatWindow: {startedAt: now(), count: 0} });
 
             try {
                 ws.send(JSON.stringify({
@@ -363,7 +376,7 @@ wss.on("connection", (ws) => {
         if (msg.type === "request_snapshot") { if (clientInfo) sendSnapshotChunks(ws, room).catch(()=>{}); return; }
         // Роли нельзя назначать сообщением клиента: они берутся только из подписанного JWT.
         if (msg.type === "snapshot") {
-            if (clientInfo && clientInfo.isHost && !clientInfo.isTester && Array.isArray(msg.data)) { room.snapshot = msg.data; room.history = []; }
+            if (clientInfo && clientInfo.isHost && !clientInfo.isTester && Array.isArray(msg.data) && msg.data.length <= 60000) { room.snapshot = msg.data; room.history = []; }
             return;
         }
         if (msg.type === "delta") {
@@ -389,7 +402,13 @@ wss.on("connection", (ws) => {
         }
         if (msg.type === "chat") {
             if (!clientInfo) return;
-            broadcast(room, { type: "chat", userId: clientInfo.userId, userName: clientInfo.userName, text: String(msg.text || "").slice(0, 1000), ts: Date.now() }, null);
+            const chatNow = now();
+            if (chatNow - clientInfo.chatWindow.startedAt >= 10000) clientInfo.chatWindow = {startedAt: chatNow, count: 0};
+            clientInfo.chatWindow.count++;
+            if (clientInfo.chatWindow.count > CHAT_MESSAGES_PER_10S) return;
+            const text = String(msg.text || "").replace(/[\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F]/g, "").trim().slice(0, 1000);
+            if (!text) return;
+            broadcast(room, { type: "chat", userId: clientInfo.userId, userName: clientInfo.userName, text, ts: chatNow }, null);
             return;
         }
         if (msg.type === "kick") {
