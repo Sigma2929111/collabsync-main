@@ -186,7 +186,7 @@ test("Server 1 and Server 2 support a real two-client collaboration session", as
         assert.equal(guestWelcome.lobbyId, created.lobbyId);
         assert.equal(guestWelcome.players.length, 2);
 
-        const receivedDelta = waitForMessage(hostSocket, message => message.type === "delta" && message.id === "ci-delta");
+        const receivedDelta = waitForMessage(hostSocket, message => message.type === "delta" && message.id === "ci-delta", 4000, "initial guest create delta");
         guestSocket.send(JSON.stringify({
             type:"delta", id:"ci-delta", kind:"create",
             userId:999999, userName:"forged identity",
@@ -218,7 +218,7 @@ test("Server 1 and Server 2 support a real two-client collaboration session", as
             permissions:{edit:true, delete:false, move:false, add:false},
         }));
         await allowUpdate;
-        const acceptedDelta = waitForMessage(hostSocket, message => message.type === "delta" && message.id === "acl-allowed");
+        const acceptedDelta = waitForMessage(hostSocket, message => message.type === "delta" && message.id === "acl-allowed", 4000, "allowed guest update delta");
         guestSocket.send(JSON.stringify({type:"delta", id:"acl-allowed", kind:"update", props:{Name:"allowed"}}));
         const allowed = await acceptedDelta;
         assert.equal(allowed.userId, 120002);
