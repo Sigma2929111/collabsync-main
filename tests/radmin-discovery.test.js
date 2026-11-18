@@ -7,6 +7,7 @@ const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const fs = require("node:fs");
+const WebSocket = require("ws");
 
 const root = path.resolve(__dirname, "..");
 const secret = "test-secret-for-collabsync-ci-only-0123456789";
@@ -87,4 +88,121 @@ test("separate Server 2 exposes loopback-only Radmin discovery", async () => {
 
 test("Server 2-in-1 exposes loopback-only Radmin discovery", async () => {
     await runDiscoveryTest("server 2 in 1", await freePort());
+});
+
+
+function waitForMessage(socket, predicate, timeoutMs = 4000) {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            socket.off("message", onMessage);
+            reject(new Error("WebSocket message timeout"));
+        }, timeoutMs);
+        function onMessage(raw) {
+            let message;
+            try { message = JSON.parse(raw.toString()); } catch (_) { return; }
+            if (!predicate(message)) return;
+            clearTimeout(timer);
+            socket.off("message", onMessage);
+            resolve(message);
+        }
+        socket.on("message", onMessage);
+    });
+}
+
+async function startNodeServer(script, port, dataDir) {
+    const child = spawn(process.execPath, [path.join(root, script)], {
+        cwd: root,
+        env: {
+            ...process.env,
+            PORT: String(port),
+            JWT_SECRET: secret,
+            ADMIN_SECRET: secret + "-admin",
+            CATALOG_PUBLIC_URL: "",
+            HOST_PUBLIC_URL: "",
+            COLLABSYNC_DATA_DIR: dataDir,
+        },
+        stdio: "ignore",
+    });
+    await waitForHealth("http://127.0.0.1:" + port + "/health", child);
+    return child;
+}
+
+test("Server 1 and Server 2 support a real two-client collaboration session", async () => {
+    const catalogPort = await freePort();
+    const hostPort = await freePort();
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "collabsync-two-client-"));
+    let catalog, host, hostSocket, guestSocket;
+    try {
+        catalog = await startNodeServer("server 1", catalogPort, dataDir);
+        host = await startNodeServer("server 2", hostPort, dataDir);
+        const catalogUrl = "http://127.0.0.1:" + catalogPort;
+        const hostUrl = "http://127.0.0.1:" + hostPort;
+
+        const createdResponse = await fetch(catalogUrl + "/api/lobby/create", {
+            method: "POST",
+            headers: {"Content-Type":"application/json"},
+            body: JSON.stringify({
+                name: "CI two-client test",
+                hostId: 120001,
+                hostName: "CI Host",
+                hostUrl,
+                placeId: 1,
+                placeName: "CI Place",
+            }),
+        });
+        assert.equal(createdResponse.status, 200);
+        const created = await createdResponse.json();
+        assert.ok(created.lobbyId && created.token);
+
+        const hostReady = new Promise((resolve, reject) => {
+            hostSocket = new WebSocket(hostUrl.replace("http://", "ws://") + "/ws");
+            hostSocket.once("error", reject);
+            hostSocket.on("open", () => hostSocket.send(JSON.stringify({type:"hello", token:created.token})));
+            waitForMessage(hostSocket, message => message.type === "welcome").then(resolve, reject);
+        });
+        const hostWelcome = await hostReady;
+        assert.equal(hostWelcome.lobbyId, created.lobbyId);
+
+        const joinedResponse = await fetch(catalogUrl + "/api/lobby/join", {
+            method: "POST",
+            headers: {"Content-Type":"application/json"},
+            body: JSON.stringify({
+                lobbyId: created.lobbyId,
+                userId: 120002,
+                userName: "CI Guest",
+            }),
+        });
+        assert.equal(joinedResponse.status, 200);
+        const joined = await joinedResponse.json();
+        assert.ok(joined.token);
+
+        const guestReady = new Promise((resolve, reject) => {
+            guestSocket = new WebSocket(hostUrl.replace("http://", "ws://") + "/ws");
+            guestSocket.once("error", reject);
+            guestSocket.on("open", () => guestSocket.send(JSON.stringify({type:"hello", token:joined.token})));
+            waitForMessage(guestSocket, message => message.type === "welcome").then(resolve, reject);
+        });
+        const guestWelcome = await guestReady;
+        assert.equal(guestWelcome.lobbyId, created.lobbyId);
+        assert.equal(guestWelcome.players.length, 2);
+
+        const receivedDelta = waitForMessage(hostSocket, message => message.type === "delta" && message.id === "ci-delta");
+        guestSocket.send(JSON.stringify({
+            type:"delta", id:"ci-delta", kind:"create",
+            userId:999999, userName:"forged identity",
+            name:"CI Part", className:"Part", parentId:"service:Workspace",
+            props:{Name:"CI Part"},
+        }));
+        const delta = await receivedDelta;
+        assert.equal(delta.userId, 120002);
+        assert.equal(delta.userName, "CI Guest");
+    } finally {
+        for (const socket of [hostSocket, guestSocket]) {
+            if (socket && socket.readyState !== WebSocket.CLOSED) socket.close();
+        }
+        for (const child of [host, catalog]) {
+            if (child && child.exitCode === null) child.kill("SIGTERM");
+        }
+        fs.rmSync(dataDir, { recursive:true, force:true });
+    }
 });
