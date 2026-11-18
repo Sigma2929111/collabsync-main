@@ -64,7 +64,7 @@ local State = {
     watched={}, connected=false, connecting=false, reconnectTask=nil,
     myPlace={whitelist={}, hostId=MY_ID},
     nameCache={[MY_ID]=MY_NAME}, scriptCache={}, partThrottle={},
-    objectMap={}, localMarkers={}, lastCamSend=0, lastCamPos=CFrame.new(),
+    objectMap={}, localMarkers={}, objectLocks={}, lastCamSend=0, lastCamPos=CFrame.new(),
     lastAck=tick(), selectionMap={}, logs={}, applyingSnapshot=false,
     joinSnapshot=nil, lastPosCheck={}, blacklist={}, kickInProgress={},
     animGradients={}, pendingChunks={}, isReconnect=false,
@@ -1329,7 +1329,7 @@ onSelectionChanged = function()
     for _, inst in pairs(State.selectionMap[MY_ID] or {}) do
         if inst and inst.Parent then
             local id = inst:GetAttribute("_CS_Id")
-            if id then sendDelta("select", {id=id, active=false, userId=MY_ID}) end
+            if id then sendDelta("select", {id=id, active=false, userId=MY_ID}); pcall(function() State.wsClient:Send(HttpService:JSONEncode({type="lock_release", objectId=id})) end) end
         end
     end
     State.selectionMap[MY_ID] = {}
@@ -1337,7 +1337,7 @@ onSelectionChanged = function()
     for _, inst in ipairs(Selection:Get()) do
         if not inst.Name:match("^_CS_") and not hasSkipAncestor(inst) then
             local id = inst:GetAttribute("_CS_Id")
-            if id then sendDelta("select", {id=id, active=true, userId=MY_ID}); table.insert(State.selectionMap[MY_ID], inst) end
+            if id then sendDelta("select", {id=id, active=true, userId=MY_ID}); pcall(function() State.wsClient:Send(HttpService:JSONEncode({type="lock_request", objectId=id})) end); table.insert(State.selectionMap[MY_ID], inst) end
         end
     end
 end
@@ -2436,6 +2436,17 @@ connectWebSocket = function(hostUrl, token, isHost, onReady, onFail, isReconnect
                 for uid in pairs(State.localMarkers) do refreshMarkerStyle(uid) end
             end
             
+        elseif data.type == "lock_state" then
+            if type(data.objectId) == "string" then
+                State.objectLocks[data.objectId] = data.lock
+                local lock = data.lock
+                if lock and lock.userId ~= MY_ID then
+                    logMsg("lobby", "info", "Объект занят: "..tostring(lock.userName or lock.userId))
+                end
+            end
+        elseif data.type == "lock_conflict" then
+            logMsg("lobby", "warn", "Конфликт: объект редактирует "..tostring(data.userName or data.userId))
+            if InPlace then showToast(InPlace, "Объект занят: "..tostring(data.userName or "участник"), T.warning) end
         elseif data.type == "heartbeat_ack" then
             State.lastAck = tick()
             
