@@ -1829,7 +1829,7 @@ local function refreshBackups()
             if not restoreArmed then
                 restoreArmed = true
                 restore.Text = "Подтвердить?"
-                showToast(S, "Нажмите ещё раз в течение 5 секунд для отката", T.warning)
+                showToast(S, "Нажмите ещё раз в течение 5 секунд для отката", T.accent)
                 task.delay(5, function()
                     if restore and restore.Parent then restoreArmed = false; restore.Text = "Откатить" end
                 end)
