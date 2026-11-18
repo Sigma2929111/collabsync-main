@@ -428,6 +428,19 @@ test("persistent workspace backup, restore, restart and owner rejoin work end-to
         const guestJoin = await guestJoinResponse.json();
         assert.equal(guestJoin.isHost, false);
 
+        const unauthorizedBackup = await fetch(base + "/api/workspace/backups/create", {
+            method:"POST",
+            headers:{"Content-Type":"application/json", "Authorization":"Bearer "+guestJoin.token},
+            body:JSON.stringify({lobbyId:created.lobbyId}),
+        });
+        assert.equal(unauthorizedBackup.status, 403, "non-owner must not create workspace backups");
+        const unauthorizedRestore = await fetch(base + "/api/workspace/backups/restore", {
+            method:"POST",
+            headers:{"Content-Type":"application/json", "Authorization":"Bearer "+guestJoin.token},
+            body:JSON.stringify({lobbyId:created.lobbyId, backupId:backupData.backup.id}),
+        });
+        assert.equal(unauthorizedRestore.status, 403, "non-owner must not restore workspace backups");
+
         const guestConnection = await connectWs(base, guestJoin.token);
         guestSocket = guestConnection.socket;
         assert.equal(guestConnection.welcome.lobbyId, created.lobbyId);
