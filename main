@@ -1423,7 +1423,7 @@ end
 lbl(Create, "Создание лобби", {font=Enum.Font.GothamBold, textSize=18, size=UDim2.new(1,0,0,28)})
 local createNameBox = fieldRow("Название", "Team Alpha", 36)
 local createPassBox = fieldRow("Пароль (пусто = открытое)", "••••••", 110)
-local createServ2Box = fieldRow("Server 2 URL (для Radmin: http://26.x.x.x:20231)", DEFAULT_HOST_URL, 184)
+local createServ2Box = fieldRow("Server 2 URL (если нет локального Radmin-сервера)", DEFAULT_HOST_URL, 184)
 
 local confRow = I("Frame", {Size=UDim2.new(1,0,0,40), Position=UDim2.fromOffset(0,258), BackgroundColor3=T.surface, BorderSizePixel=0}, Create)
 round(confRow, 8); outline(confRow, T.border, 1)
@@ -1454,29 +1454,15 @@ end)
 
 local publishBtn = btn(Create, "Опубликовать", {size=UDim2.new(1,0,0,44), pos=UDim2.fromOffset(0,350), bg=T.accent, hoverBg=T.accent2, textSize=14})
 
--- Direct tab (Radmin / LAN)
+-- Direct tab (Radmin / LAN): automatic discovery through the shared lobby catalog.
 local Direct = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Visible=false}, Content)
-lbl(Direct, "Прямое подключение (Radmin VPN)", {font=Enum.Font.GothamBold, textSize=18, size=UDim2.new(1,0,0,28)})
-
-lbl(Direct, "IP и Порт сервера (напр. 26.123.45.67:20231)", {textSize=12, color=T.muted, size=UDim2.new(1,0,0,18), pos=UDim2.fromOffset(0,36)})
-local directUrlBox = I("TextBox", {Size=UDim2.new(1,0,0,40), Position=UDim2.fromOffset(0,58), BackgroundColor3=T.surface, BorderSizePixel=0, Font=Enum.Font.Gotham, TextSize=13, TextColor3=T.text, PlaceholderText="http://26.x.x.x:20231", PlaceholderColor3=T.muted, Text="", TextXAlignment=Enum.TextXAlignment.Left}, Direct)
-round(directUrlBox, 8); outline(directUrlBox, T.border, 1); pad(directUrlBox, 8, 10)
-
-lbl(Direct, "JWT Токен", {textSize=12, color=T.muted, size=UDim2.new(1,0,0,18), pos=UDim2.fromOffset(0,106)})
-local directTokenBox = I("TextBox", {Size=UDim2.new(1,0,0,40), Position=UDim2.fromOffset(0,128), BackgroundColor3=T.surface, BorderSizePixel=0, Font=Enum.Font.Gotham, TextSize=13, TextColor3=T.text, PlaceholderText="Вставьте токен", PlaceholderColor3=T.muted, Text="", TextXAlignment=Enum.TextXAlignment.Left}, Direct)
-round(directTokenBox, 8); outline(directTokenBox, T.border, 1); pad(directTokenBox, 8, 10)
-
-local directBtn = btn(Direct, "Подключиться", {size=UDim2.new(1,0,0,44), pos=UDim2.fromOffset(0,186), bg=T.accent, hoverBg=T.accent2, textSize=14})
-
--- Restore only the last Radmin address; never persist session tokens.
-if PLUGIN then
-    pcall(function()
-        local savedUrl = PLUGIN:GetSetting("cs_radmin_url")
-        if type(savedUrl) == "string" then directUrlBox.Text = savedUrl end
-    end)
-end
-
-lbl(Direct, "Инструкция для Радмина:\n1. Создатель вводит свой Radmin IP в поле 'Server 2 URL' при создании.\n2. Друг вводит этот же IP и полученный токен сюда.\n3. Сервер должен быть запущен на ПК создателя (или на хосте с Radmin IP).", {textSize=11, color=T.muted, wrapped=true, size=UDim2.new(1,0,0,60), pos=UDim2.fromOffset(0,240)})
+lbl(Direct, "Radmin VPN — автоматическое обнаружение", {font=Enum.Font.GothamBold, textSize=18, size=UDim2.new(1,0,0,28)})
+lbl(Direct, "Хост запускает Server 2 на своём ПК и создаёт лобби. Плагин сам определяет Radmin IPv4 и публикует адрес в каталоге. Участники выбирают найденное лобби здесь — IP и JWT вручную вводить не нужно.", {textSize=12, color=T.muted, wrapped=true, size=UDim2.new(1,0,0,58), pos=UDim2.fromOffset(0,34)})
+local radminStatus = lbl(Direct, "Поиск Radmin-лобби...", {textSize=12, color=T.muted, size=UDim2.new(1,0,0,22), pos=UDim2.fromOffset(0,100)})
+local radminRefreshBtn = btn(Direct, "Обновить список", {size=UDim2.fromOffset(150,34), pos=UDim2.fromOffset(0,128), bg=T.accent, hoverBg=T.accent2, textSize=12})
+local radminList = I("ScrollingFrame", {Size=UDim2.new(1,0,1,-176), Position=UDim2.fromOffset(0,174), BackgroundColor3=T.surface, BorderSizePixel=0, CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y, ScrollBarThickness=6, ScrollBarImageColor3=T.border}, Direct)
+round(radminList, 10); outline(radminList, T.border, 1); pad(radminList, 8)
+I("UIListLayout", {Padding=UDim.new(0,8), SortOrder=Enum.SortOrder.LayoutOrder}, radminList)
 
 local switchTo
 switchTo = function(which)
@@ -2421,6 +2407,43 @@ card = function(placeName, lobbyName, players, opts)
     return c
 end
 
+local function isRadminAddress(url)
+    if type(url) ~= "string" then return false end
+    local host = url:match("^https?://([^:/]+)")
+    if not host then return false end
+    return host:match("^26%.") ~= nil
+        or host:match("^10%.") ~= nil
+        or host:match("^192%.168%.") ~= nil
+        or host:match("^172%.(1[6-9]|2[0-9]|3[01])%.") ~= nil
+end
+local function renderRadminLobbies()
+    for _, child in ipairs(radminList:GetChildren()) do
+        if child:IsA("Frame") or child:IsA("TextLabel") then child:Destroy() end
+    end
+    local count = 0
+    for _, lobby in ipairs(State.remoteLobbies or {}) do
+        if isRadminAddress(lobby.hostUrl) then
+            count += 1
+            local item = card(lobby.placeName or "Roblox Place", lobby.name, 0, {
+                placeId=lobby.placeId, confidential=lobby.hasPassword,
+                hostName=lobby.hostName, lobbyId=lobby.id
+            })
+            item.Parent = radminList
+        end
+    end
+    radminStatus.Text = count > 0 and ("Найдено Radmin/LAN-лобби: "..count) or "Лобби не найдены. Проверьте, что хост запустил Server 2 и создал сессию."
+end
+radminRefreshBtn.MouseButton1Click:Connect(function()
+    radminStatus.Text = "Поиск лобби..."
+    local ok, response = httpJson(CATALOG_URL.."/api/lobby/list", "GET")
+    if ok and response and response.lobbies then
+        State.remoteLobbies = response.lobbies
+        renderRadminLobbies()
+    else
+        radminStatus.Text = "Каталог недоступен: "..tostring(response and response.error or response)
+    end
+end)
+
 attemptJoin = function(lobbyId, password, hostName)
     showToast(Main, "Подключение...", T.accent)
     local ok, res = httpJson(CATALOG_URL.."/api/lobby/join", "POST", {
@@ -2484,6 +2507,20 @@ publishLobby = function()
     local pass = createPassBox.Text
     local hostUrl = createServ2Box.Text
     if hostUrl == "" then hostUrl = DEFAULT_HOST_URL end
+    -- Prefer a locally running Server 2 and detect its Radmin adapter automatically.
+    for _, localPort in ipairs({3001, 3000}) do
+        local probeOk, probeResponse = pcall(function()
+            return HttpService:RequestAsync({Url="http://127.0.0.1:"..localPort.."/network-info", Method="GET"})
+        end)
+        if probeOk and probeResponse and probeResponse.Success then
+            local decodedOk, networkInfo = pcall(function() return HttpService:JSONDecode(probeResponse.Body) end)
+            if decodedOk and type(networkInfo) == "table" and type(networkInfo.radminIp) == "string" and networkInfo.radminIp ~= "" then
+                hostUrl = "http://"..networkInfo.radminIp..":"..tostring(networkInfo.port or localPort)
+                logMsg("network", "success", "Radmin VPN обнаружен автоматически: "..networkInfo.radminIp)
+                break
+            end
+        end
+    end
     
     showToast(Create, "Создание лобби...", T.accent)
     
@@ -2612,6 +2649,7 @@ startCatalogPoll = function()
                 local ok, res = httpJson(CATALOG_URL.."/api/lobby/list", "GET")
                 if ok and res and res.lobbies then
                     State.remoteLobbies = res.lobbies
+                    if Direct.Visible then renderRadminLobbies() end
                     for _, ch in ipairs(aList:GetChildren()) do if ch:IsA("Frame") then ch:Destroy() end end
                     for _, ch in ipairs(aListAll:GetChildren()) do if ch:IsA("Frame") then ch:Destroy() end end
                     
