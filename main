@@ -2480,6 +2480,10 @@ connectWebSocket = function(hostUrl, token, isHost, onReady, onFail, isReconnect
         elseif data.type == "lock_conflict" then
             logMsg("lobby", "warn", "Конфликт: объект редактирует "..tostring(data.userName or data.userId))
             if InPlace then showToast(InPlace, "Объект занят: "..tostring(data.userName or "участник"), T.danger) end
+        elseif data.type == "permission_denied" then
+            local actionName = tostring(data.action or "операция")
+            logMsg("lobby", "warn", "Недостаточно прав для действия: "..actionName)
+            if InPlace then showToast(InPlace, "Недостаточно прав: "..actionName, T.warn) end
         elseif data.type == "heartbeat_ack" then
             State.lastAck = tick()
             
