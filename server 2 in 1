@@ -406,7 +406,7 @@ wss.on("connection", (ws) => {
             if (chatNow - clientInfo.chatWindow.startedAt >= 10000) clientInfo.chatWindow = {startedAt: chatNow, count: 0};
             clientInfo.chatWindow.count++;
             if (clientInfo.chatWindow.count > CHAT_MESSAGES_PER_10S) return;
-            const text = String(msg.text || "").replace(/[\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F]/g, "").trim().slice(0, 1000);
+            const text = String(msg.text || "").replace(/[\\x00-\\x1F]/g, "").trim().slice(0, 1000);
             if (!text) return;
             broadcast(room, { type: "chat", userId: clientInfo.userId, userName: clientInfo.userName, text, ts: chatNow }, null);
             return;
