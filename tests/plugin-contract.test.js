@@ -30,3 +30,8 @@ test("owner review diff includes object name, parent and attributes", () => {
     assert.match(reviewHandler, /delta\.attrs/);
     assert.match(reviewHandler, /delta\.props/);
 });
+test("plugin exposes chat camera and selection permission controls", () => {
+    assert.match(pluginSource, /"Редакт\.", "Удалять", "Двигать", "Добавлять", "Чат", "Камера", "Выбор"/);
+    assert.match(pluginSource, /chat=selected\[5\], camera=selected\[6\], select=selected\[7\]/);
+    assert.match(pluginSource, /permissions\.chat == true, permissions\.camera == true, permissions\.select == true/);
+});
