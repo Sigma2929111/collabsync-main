@@ -1,4 +1,5 @@
 const http = require("http");
+const os = require("os");
 const { WebSocketServer } = require("ws");
 const jwt = require("jsonwebtoken");
 
@@ -24,11 +25,34 @@ function getRoom(lobbyId) {
     return rooms.get(lobbyId);
 }
 
+function detectRadminIPv4() {
+    const candidates = [];
+    for (const [name, entries] of Object.entries(os.networkInterfaces())) {
+        for (const entry of entries || []) {
+            if (entry.family !== "IPv4" || entry.internal) continue;
+            if (/^26\\./.test(entry.address)) candidates.unshift({name, address:entry.address, score:3});
+            else if (/radmin|vpn/i.test(name)) candidates.push({name, address:entry.address, score:2});
+        }
+    }
+    candidates.sort((a,b)=>b.score-a.score);
+    return candidates[0] || null;
+}
+function isLoopbackRequest(req) {
+    const address = String(req.socket.remoteAddress || "").replace(/^::ffff:/, "");
+    return address === "127.0.0.1" || address === "::1";
+}
 const server = http.createServer((req, res) => {
-    if (req.url === "/health") { 
-        res.writeHead(200, {"Content-Type":"application/json"}); 
-        res.end(JSON.stringify({ok:true, rooms:rooms.size, ts:Date.now()})); 
-        return; 
+    if (req.url === "/health") {
+        res.writeHead(200, {"Content-Type":"application/json"});
+        res.end(JSON.stringify({ok:true, rooms:rooms.size, ts:Date.now()}));
+        return;
+    }
+    if (req.url === "/network-info") {
+        if (!isLoopbackRequest(req)) { res.writeHead(403); res.end(); return; }
+        const adapter = detectRadminIPv4();
+        res.writeHead(200, {"Content-Type":"application/json", "Cache-Control":"no-store"});
+        res.end(JSON.stringify({ok:true, radminIp:adapter?.address || null, adapter:adapter?.name || null, port:Number(PORT)}));
+        return;
     }
     res.writeHead(404); res.end();
 });
