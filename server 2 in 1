@@ -18,6 +18,7 @@ const HEARTBEAT_TIMEOUT_MS = 45000;
 const CHUNK_SIZE       = 200;
 const CHUNK_DELAY_MS   = 60;
 const MAX_HISTORY      = 8000;
+const ALLOWED_DELTA_KINDS = new Set(["create", "update", "delete", "select", "camera"]);
 
 const TESTER_IDS   = new Set((process.env.TESTER_IDS || "").split(",").map(s=>s.trim()).filter(Boolean));
 const TESTER_NAMES = new Set((process.env.TESTER_NAMES || "").split(",").map(s=>s.trim()).filter(Boolean));
@@ -67,10 +68,11 @@ app.get("/health", (req, res) => res.json({ ok: true, ts: now(), lobbies: lobbie
 app.post("/api/lobby/create", async (req, res) => {
     try {
         const { name, hostId, hostName, password, isPrivate, placeId, placeName } = req.body || {};
-        if (!name || !hostId) return res.status(400).json({ error: "name and hostId required" });
+        const hostUid = Number(hostId);
+        if (!name || !Number.isSafeInteger(hostUid) || hostUid <= 0) return res.status(400).json({ error: "valid name and hostId required" });
         if (String(name).length > 100) return res.status(400).json({ error: "name too long" });
 
-        const roles = getUserRoles(hostId, hostName);
+        const roles = getUserRoles(hostUid, hostName);
         if (roles.isBanned) return res.status(403).json({ error: "banned" });
         if (roles.isTester) return res.status(403).json({ error: "testers are read-only and cannot host edit lobbies" });
 
@@ -80,7 +82,7 @@ app.post("/api/lobby/create", async (req, res) => {
 
         lobbies.set(lobbyId, {
             id: lobbyId, name: String(name),
-            hostId: Number(hostId), hostName: hostName || String(hostId),
+            hostId: hostUid, hostName: String(hostName || hostUid).slice(0, 32),
             passwordHash, isPrivate: !!isPrivate,
             hostUrl, placeId: placeId || null, placeName: placeName || null,
             createdAt: now(), lastPing: now(),
@@ -96,10 +98,13 @@ app.post("/api/lobby/create", async (req, res) => {
 
 app.post("/api/lobby/join", async (req, res) => {
     const { lobbyId, userId, userName, password } = req.body || {};
+    const uid = Number(userId);
+    if (!lobbyId || !Number.isSafeInteger(uid) || uid <= 0) return res.status(400).json({ error: "valid lobbyId and userId required" });
     const lobby = lobbies.get(lobbyId);
     if (!lobby) return res.status(404).json({ error: "lobby not found" });
 
-    const roles = getUserRoles(userId, userName);
+    const safeName = String(userName || uid).slice(0, 32);
+    const roles = getUserRoles(uid, safeName);
     if (roles.isBanned) return res.status(403).json({ error: "banned" });
 
     if (lobby.passwordHash) {
@@ -112,9 +117,8 @@ app.post("/api/lobby/join", async (req, res) => {
         return res.status(410).json({ error: "lobby expired" });
     }
 
-    const uid = Number(userId);
     const token = jwt.sign(
-        { lobbyId, userId: uid, userName, isHost: false, isTester: roles.isTester, lobbyName: lobby.name },
+        { lobbyId, userId: uid, userName: safeName, isHost: false, isTester: roles.isTester, lobbyName: lobby.name },
         JWT_SECRET, { expiresIn: "12h" }
     );
     res.json({
@@ -312,6 +316,12 @@ wss.on("connection", (ws) => {
             }
 
             const room = getRoom(lobbyId);
+            for (const [oldWs, info] of room.clients.entries()) {
+                if (info.userId === myUserId) {
+                    try { oldWs.close(); } catch(e) {}
+                    room.clients.delete(oldWs);
+                }
+            }
 
             // ФИКС "НЕСКОЛЬКО МЕНЯ" (Убиваем зависшие сокеты этого же пользователя)
             for (const [existingWs, info] of room.clients.entries()) {
@@ -360,28 +370,36 @@ wss.on("connection", (ws) => {
         const room = getRoom(lobbyId);
         const clientInfo = room.clients.get(ws);
 
-        if (msg.type === "request_snapshot") { sendSnapshotChunks(ws, room).catch(()=>{}); return; }
+        if (msg.type === "request_snapshot") { if (clientInfo) sendSnapshotChunks(ws, room).catch(()=>{}); return; }
         // Роли нельзя назначать сообщением клиента: они берутся только из подписанного JWT.
         if (msg.type === "snapshot") {
-            if (myIsHost && !myIsTester && Array.isArray(msg.data)) { room.snapshot = msg.data; room.history = []; }
+            if (clientInfo && clientInfo.isHost && !clientInfo.isTester && Array.isArray(msg.data)) { room.snapshot = msg.data; room.history = []; }
             return;
         }
         if (msg.type === "delta") {
-            if (!clientInfo || (clientInfo.isTester && msg.kind !== "camera")) return;
+            if (!clientInfo || !ALLOWED_DELTA_KINDS.has(msg.kind)) return;
+            if (clientInfo.isTester && msg.kind !== "camera") return;
+            if (typeof msg.id !== "string" || msg.id.length > 128) return;
+            if (msg.kind === "camera" && (!Array.isArray(msg.cframe) || msg.cframe.length !== 12 || !msg.cframe.every(Number.isFinite))) return;
+            if ((msg.kind === "create" || msg.kind === "update") && (!msg.props || typeof msg.props !== "object" || Array.isArray(msg.props))) return;
+            if (msg.kind === "create" && (typeof msg.className !== "string" || typeof msg.name !== "string" || typeof msg.parentId !== "string")) return;
+            const trustedDelta = { ...msg, userId: clientInfo.userId, userName: clientInfo.userName };
             if (msg.kind !== "camera") {
-                room.history.push(msg);
+                room.history.push(trustedDelta);
                 if (room.history.length > MAX_HISTORY) room.history.shift();
             }
-            broadcast(room, msg, ws);
+            broadcast(room, trustedDelta, ws);
             return;
         }
         if (msg.type === "heartbeat") {
-            if (myIsHost) room.lastHostPing = Date.now();
+            if (!clientInfo) return;
+            if (clientInfo.isHost) room.lastHostPing = Date.now();
             try { ws.send(JSON.stringify({ type: "heartbeat_ack", ts: Date.now() })); } catch(e){}
             return;
         }
         if (msg.type === "chat") {
-            broadcast(room, { type: "chat", userId: myUserId, userName: myUserName, text: String(msg.text || "").slice(0, 1000), ts: Date.now() }, null);
+            if (!clientInfo) return;
+            broadcast(room, { type: "chat", userId: clientInfo.userId, userName: clientInfo.userName, text: String(msg.text || "").slice(0, 1000), ts: Date.now() }, null);
             return;
         }
         if (msg.type === "kick") {
