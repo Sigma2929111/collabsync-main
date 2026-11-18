@@ -196,6 +196,32 @@ test("Server 1 and Server 2 support a real two-client collaboration session", as
         const delta = await receivedDelta;
         assert.equal(delta.userId, 120002);
         assert.equal(delta.userName, "CI Guest");
+
+        const denyUpdate = waitForMessage(guestSocket, message =>
+            message.type === "players" && message.players.some(p => p.userId === 120002 && p.permissions && p.permissions.edit === false)
+        );
+        hostSocket.send(JSON.stringify({
+            type:"permissions_update", targetUserId:120002,
+            permissions:{edit:false, delete:false, move:false, add:false},
+        }));
+        await denyUpdate;
+        const deniedDelta = waitForMessage(hostSocket, message => message.type === "delta" && message.id === "acl-denied", 300)
+            .then(() => true, () => false);
+        guestSocket.send(JSON.stringify({type:"delta", id:"acl-denied", kind:"update", props:{Name:"blocked"}}));
+        assert.equal(await deniedDelta, false, "server must reject an update without edit permission");
+
+        const allowUpdate = waitForMessage(guestSocket, message =>
+            message.type === "players" && message.players.some(p => p.userId === 120002 && p.permissions && p.permissions.edit === true)
+        );
+        hostSocket.send(JSON.stringify({
+            type:"permissions_update", targetUserId:120002,
+            permissions:{edit:true, delete:false, move:false, add:false},
+        }));
+        await allowUpdate;
+        const acceptedDelta = waitForMessage(hostSocket, message => message.type === "delta" && message.id === "acl-allowed");
+        guestSocket.send(JSON.stringify({type:"delta", id:"acl-allowed", kind:"update", props:{Name:"allowed"}}));
+        const allowed = await acceptedDelta;
+        assert.equal(allowed.userId, 120002);
     } finally {
         for (const socket of [hostSocket, guestSocket]) {
             if (socket && socket.readyState !== WebSocket.CLOSED) socket.close();
