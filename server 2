@@ -427,7 +427,7 @@ wss.on("connection", (ws) => {
         }
         
         if (msg.type === "chat") {
-            if (!clientInfo) return;
+            if (!clientInfo || (!clientInfo.isHost && clientInfo.permissions?.chat !== true)) return;
             const chatNow = Date.now();
             if (chatNow - clientInfo.chatWindow.startedAt >= 10000) clientInfo.chatWindow = {startedAt: chatNow, count: 0};
             clientInfo.chatWindow.count++;
