@@ -2511,7 +2511,13 @@ startHeartbeat = function()
     if State.heartbeatThread then task.cancel(State.heartbeatThread) end
     State.heartbeatThread = task.spawn(function()
         while State.session do
-            if State.wsClient then pcall(function() State.wsClient:Send(HttpService:JSONEncode({type="heartbeat", userId=MY_ID})) end) end
+            if State.wsClient then
+                pcall(function() State.wsClient:Send(HttpService:JSONEncode({type="heartbeat", userId=MY_ID})) end)
+                for _, inst in pairs(State.selectionMap[MY_ID] or {}) do
+                    local objectId = inst and inst.Parent and inst:GetAttribute("_CS_Id")
+                    if objectId then pcall(function() State.wsClient:Send(HttpService:JSONEncode({type="lock_request", objectId=objectId})) end) end
+                end
+            end
             if State.session.lobbyId and State.session.lobbyId ~= "direct" then
                 if State.session and State.session.token then
                 pcall(function()
