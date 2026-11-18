@@ -622,6 +622,7 @@ test("Server 2-in-1 enforces member ACL and object claims", async () => {
         const disablePresence = waitForMessage(guestSocket, m => m.type === "players" && m.players.some(p => p.userId === 150002 && p.permissions?.chat === false && p.permissions?.camera === false && p.permissions?.select === false), 4000, "disable chat and presence");
         hostSocket.send(JSON.stringify({type:"permissions_update", targetUserId:150002, permissions:{edit:true, delete:true, move:true, add:true, chat:false, camera:false, select:false}}));
         await disablePresence;
+        guestSocket.send(JSON.stringify({type:"permissions_update", targetUserId:150002, permissions:{edit:true, delete:true, move:true, add:true, chat:true, camera:true, select:true}}));
         const blockedChat = waitForMessage(hostSocket, m => m.type === "chat" && m.userId === 150002, 250).then(() => true, () => false);
         guestSocket.send(JSON.stringify({type:"chat", text:"must not be delivered"}));
         assert.equal(await blockedChat, false, "server must enforce chat permission");
