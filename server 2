@@ -149,8 +149,9 @@ wss.on("connection", (ws) => {
         if (!msg || typeof msg !== "object") return;
         
         if (msg.type === "hello") {
+            let decoded;
             try {
-                const decoded = jwt.verify(msg.token, JWT_SECRET);
+                decoded = jwt.verify(msg.token, JWT_SECRET);
                 lobbyId = decoded.lobbyId;
                 if (typeof decoded.lobbyId !== "string" || !decoded.lobbyId || !Number.isSafeInteger(Number(decoded.userId)) || Number(decoded.userId) <= 0) {
                     throw new Error("invalid token claims");
