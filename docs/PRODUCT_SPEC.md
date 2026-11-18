@@ -7,7 +7,7 @@
 
 ## Фактический статус текущей ветки
 
-- **Частично реализовано:** базовый обмен snapshot/delta, чат/presence, тестер read-only на уровне серверных edit-delta, экспериментальные persistent workspaces и backup для Server 2-in-1.
+- **Частично реализовано:** базовый обмен snapshot/delta, чат/presence, тестер read-only на уровне серверных edit-delta, экспериментальные persistent workspaces, backup и краткий журнал активности для Server 2-in-1.
 - **Не реализовано:** changeset review/diff/accept/reject; отдельный Play Test канал; WebRTC голос; полноценный ACL; постоянная БД и split-mode persistence; надёжная аутентификация Roblox identity.
 - **Не подтверждено тестами:** реальная синхронизация нескольких Studio-клиентов, аварийное восстановление, крупные Place, конфликтные изменения и сетевые разрывы.
 
