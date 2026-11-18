@@ -359,7 +359,7 @@ setInterval(() => {
 
         if (room.locks) {
             for (const [objectId, lock] of room.locks.entries()) {
-                if (lock.expiresAt <= now) {
+                if (lock.expiresAt <= t) {
                     room.locks.delete(objectId);
                     broadcast(room, {type:"lock_state", objectId, lock:null});
                 }
