@@ -1918,7 +1918,7 @@ local openSettings = function(context)
     sTabPlace.Visible = (currentWhitelistScope ~= nil)
     sTabPerms.Visible = (context == "inplace" and isOwnLobby)
     sTabBlack.Visible = isOwnerRole
-    sTabBackups.Visible = (context == "inplace" and isOwnLobby and State.session and State.session.persistent == true)
+    sTabBackups.Visible = (context == "inplace" and isOwnLobby and State.session ~= nil and State.session.persistent == true)
     switchSTab("gui")
 end
 settingsBtn.MouseButton1Click:Connect(function() openSettings("main") end)
