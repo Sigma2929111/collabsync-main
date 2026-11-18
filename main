@@ -51,6 +51,7 @@ local refreshMarkerStyle, setupMarkerRotation, updateMarkerRotation
 local connectWebSocket, startHeartbeat, stopSession, exitLobbyUI
 local attemptJoin, card, publishLobby, directConnect, startCatalogPoll
 local processPendingMarkers
+local showReviewPrompt
 
 local MY_ROLES = {isTester=false, isBanned=false}
 local roleCache = {}
@@ -1036,6 +1037,43 @@ local function buildSnapshot()
     end
     return out
 end
+
+local function applySnapshotItems(items, onComplete)
+    task.spawn(function()
+        State.applyingSnapshot = true
+        local hostIds = {}
+        for i, item in ipairs(items or {}) do
+            hostIds[item.id] = true
+            local existing = State.objectMap[item.id]
+            if existing and existing.Parent then
+                applyDelta({kind="update", id=item.id, name=item.name, props=item.props, attrs=item.attrs})
+                local parent
+                if item.parentId == "game" then parent = game
+                elseif type(item.parentId) == "string" and item.parentId:match("^service:") then parent = game:GetService(item.parentId:sub(9))
+                else parent = State.objectMap[item.parentId] end
+                if parent and existing.Parent ~= parent then pcall(function() existing.Parent = parent end) end
+                pcall(function() existing:SetAttribute("_CS_ParentId", item.parentId) end)
+            else
+                applyDelta({kind="create", id=item.id, parentId=item.parentId, className=item.className, name=item.name, props=item.props, attrs=item.attrs})
+            end
+            if i % APPLY_CHUNK == 0 then task.wait(APPLY_CHUNK_DELAY) end
+        end
+        task.wait(0.3)
+        local removed = 0
+        for id, inst in pairs(State.objectMap) do
+            if not hostIds[id] and inst and inst.Parent then
+                pcall(function() inst:Destroy() end)
+                State.objectMap[id] = nil
+                removed = removed + 1
+            end
+        end
+        logMsg("lobby", "info", "Снапшот применён: "..#(items or {})..", удалено: "..removed)
+        State.synced = true
+        State.applyingSnapshot = false
+        if onComplete then pcall(onComplete) end
+    end)
+end
+
 local function sendDelta(kind, data)
     if not State.wsClient or not State.connected then return false end
     if MY_ROLES.isTester and kind ~= "camera" then return false end
@@ -1927,6 +1965,71 @@ settingsBtn.MouseButton1Click:Connect(function() openSettings("main") end)
 -- IN-PLACE (ЧАТ И ИГРОКИ)
 --==================================================================
 InPlace = I("Frame", {Name="InPlaceFrame", Size=UDim2.fromOffset(860,600), Position=UDim2.new(0.5,-430,0.5,-300), BackgroundColor3=T.bg, BorderSizePixel=0, Visible=false}, root)
+
+showReviewPrompt = function(snapshotItems, historyItems)
+    if State.reviewPrompt or not State.session or not State.session.isHost or not State.session.persistent then return end
+    State.reviewPrompt = true
+    local summary = {}
+    local byUser = {}
+    for _, delta in ipairs(historyItems or {}) do
+        local kind = tostring(delta.kind or "change")
+        summary[kind] = (summary[kind] or 0) + 1
+        local who = tostring(delta.userName or delta.userId or "Участник")
+        byUser[who] = (byUser[who] or 0) + 1
+    end
+    local parts = {}
+    for kind, count in pairs(summary) do table.insert(parts, kind..": "..count) end
+    table.sort(parts)
+    local people = {}
+    for who, count in pairs(byUser) do table.insert(people, who.." ("..count..")") end
+    table.sort(people)
+    local description = "Сервер хранит "..tostring(#(snapshotItems or {})).." объектов и "..tostring(#(historyItems or {})).." изменений.\n"
+        .. (#parts > 0 and table.concat(parts, " · ") or "Новых событий нет") .. "\n"
+        .. (#people > 0 and table.concat(people, ", ") or "Нет участников в журнале")
+    local overlay = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=0.45, BorderSizePixel=0, ZIndex=300}, root)
+    local dialog = I("Frame", {Size=UDim2.fromOffset(500,290), Position=UDim2.fromScale(0.5,0.5), AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=T.surface, BorderSizePixel=0, ZIndex=301}, overlay)
+    round(dialog, 14); outline(dialog, T.border, 1)
+    lbl(dialog, "Изменения, пока вас не было", {font=Enum.Font.GothamBold, textSize=18, size=UDim2.new(1,-40,0,28), pos=UDim2.fromOffset(20,18), zIndex=302})
+    lbl(dialog, description, {textSize=12, color=T.muted, wrapped=true, size=UDim2.new(1,-40,0,110), pos=UDim2.fromOffset(20,58), zIndex=302})
+    lbl(dialog, "Принять — применить серверную версию и новые изменения. Отклонить — оставить вашу текущую сцену и заменить серверную версию ею.", {textSize=11, color=T.text, wrapped=true, size=UDim2.new(1,-40,0,44), pos=UDim2.fromOffset(20,174), zIndex=302})
+    local accept = btn(dialog, "Принять изменения", {size=UDim2.fromOffset(220,38), pos=UDim2.fromOffset(20,232), bg=T.accent, hoverBg=T.accent2, textSize=12, zIndex=303})
+    local reject = btn(dialog, "Отклонить и оставить мою версию", {size=UDim2.new(1,-260,0,38), pos=UDim2.fromOffset(250,232), bg=T.surf2, hoverBg=T.danger, textSize=11, zIndex=303})
+    local busy = false
+    accept.MouseButton1Click:Connect(function()
+        if busy then return end
+        busy = true; accept.Text = "Применение..."; reject.Active = false
+        overlay:Destroy()
+        local function applyHistoryAndCompact()
+            task.spawn(function()
+                for _, delta in ipairs(historyItems or {}) do
+                    if delta.kind ~= "camera" then applyDelta(delta) end
+                end
+                task.wait(0.6)
+                if State.wsClient and State.connected then
+                    local compacted = buildSnapshot()
+                    local sent = pcall(function() State.wsClient:Send(HttpService:JSONEncode({type="snapshot", data=compacted})) end)
+                    if sent then logMsg("lobby", "success", "Изменения приняты; серверный snapshot обновлён") end
+                end
+                State.pendingReviewSnapshot = nil; State.pendingReviewHistory = nil; State.reviewPrompt = false
+            end)
+        end
+        if snapshotItems and #snapshotItems > 0 then applySnapshotItems(snapshotItems, applyHistoryAndCompact)
+        else applyHistoryAndCompact() end
+    end)
+    reject.MouseButton1Click:Connect(function()
+        if busy then return end
+        busy = true
+        overlay:Destroy()
+        task.spawn(function()
+            local localSnapshot = buildSnapshot()
+            if State.wsClient and State.connected then
+                local sent = pcall(function() State.wsClient:Send(HttpService:JSONEncode({type="snapshot", data=localSnapshot})) end)
+                if sent then logMsg("lobby", "warn", "Серверные изменения отклонены; сохранена локальная версия") end
+            end
+            State.pendingReviewSnapshot = nil; State.pendingReviewHistory = nil; State.reviewPrompt = false
+        end)
+    end)
+end
 round(InPlace, 14); outline(InPlace, T.border, 1)
 local IPHeader = I("Frame", {Size=UDim2.new(1,0,0,62), BackgroundColor3=T.surface, BorderSizePixel=0}, InPlace)
 round(IPHeader, 14)
@@ -2063,6 +2166,9 @@ connectWebSocket = function(hostUrl, token, isHost, onReady, onFail, isReconnect
     State.connected = false
     State.synced = false
     State.pendingChunks = {}
+    State.pendingReviewSnapshot = nil
+    State.pendingReviewHistory = nil
+    State.reviewPrompt = false
     State.isReconnect = isReconnect or false
     
     local wsUrl = hostUrl
@@ -2164,46 +2270,32 @@ connectWebSocket = function(hostUrl, token, isHost, onReady, onFail, isReconnect
                     for _, item in ipairs(c.chunk) do table.insert(allItems, item) end
                 end
                 State.pendingChunks = {}
-                task.spawn(function()
-                    State.applyingSnapshot = true
-                    local hostIds = {}
-                    for i, item in ipairs(allItems) do
-                        hostIds[item.id] = true
-                        applyDelta({kind="create", id=item.id, parentId=item.parentId, className=item.className, name=item.name, props=item.props, attrs=item.attrs})
-                        if i % APPLY_CHUNK == 0 then task.wait(APPLY_CHUNK_DELAY) end
-                    end
-                    task.wait(0.3)
-                    local removed = 0
-                    for id, inst in pairs(State.objectMap) do
-                        if not hostIds[id] and inst and inst.Parent then
-                            pcall(function() inst:Destroy() end)
-                            State.objectMap[id] = nil
-                            removed = removed + 1
+                if State.session and State.session.isHost and State.session.persistent then
+                    State.pendingReviewSnapshot = allItems
+                    task.delay(0.75, function()
+                        if State.pendingReviewSnapshot and not State.reviewPrompt and showReviewPrompt then
+                            showReviewPrompt(State.pendingReviewSnapshot, State.pendingReviewHistory or {})
                         end
-                    end
-                    logMsg("lobby", "info", "Снапшот: "..#allItems..", удалено: "..removed)
-                    State.synced = true
-                    task.delay(0.5, function() State.applyingSnapshot = false end)
-                end)
+                    end)
+                else
+                    applySnapshotItems(allItems)
+                end
             end
             
         elseif data.type == "history" then
-            task.spawn(function()
-                while State.applyingSnapshot do task.wait(0.1) end
-                for _, delta in ipairs(data.data or {}) do
-                    if delta.kind ~= "camera" then applyDelta(delta) end
+            if State.session and State.session.isHost and State.session.persistent then
+                State.pendingReviewHistory = data.data or {}
+                if showReviewPrompt then
+                    showReviewPrompt(State.pendingReviewSnapshot or {}, State.pendingReviewHistory)
                 end
-                -- После восстановления истории владелец фиксирует объединённое состояние,
-                -- чтобы сервер не проигрывал те же события при каждом следующем подключении.
-                if State.session and State.session.isHost and State.session.persistent and State.wsClient == client then
-                    task.wait(0.5)
-                    local compacted = buildSnapshot()
-                    local sent = pcall(function()
-                        client:Send(HttpService:JSONEncode({type="snapshot", data=compacted}))
-                    end)
-                    if sent then logMsg("lobby", "info", "История применена и сохранена в новый snapshot: "..#compacted.." объектов") end
-                end
-            end)
+            else
+                task.spawn(function()
+                    while State.applyingSnapshot do task.wait(0.1) end
+                    for _, delta in ipairs(data.data or {}) do
+                        if delta.kind ~= "camera" then applyDelta(delta) end
+                    end
+                end)
+            end
             
         elseif data.type == "delta" then
             applyDelta(data)
