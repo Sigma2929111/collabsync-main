@@ -79,7 +79,7 @@ app.use((req, res, next) => {
     next();
 });
 
-setInterval(() => {
+const cleanupTimer = setInterval(() => {
     const t = now();
     for (const [id, l] of lobbies.entries()) {
         if (!l.persistent && t - l.lastPing > HEARTBEAT_TIMEOUT_MS) { 
@@ -251,9 +251,22 @@ app.get("/api/admin/banlist", (req, res) => {
     res.json({ banned: Array.from(bannedUsers) });
 });
 
-setInterval(() => {
+const healthTimer = setInterval(() => {
     const url = CATALOG_PUBLIC_URL ? CATALOG_PUBLIC_URL + "/health" : `http://localhost:${PORT}/health`;
     fetch(url).catch(()=>{});
 }, 10000);
 
-restorePersistentLobbies().then(() => app.listen(PORT, () => console.log(`[Catalog] listening ${PORT}`))).catch(err => { console.error("[Persistence] catalog startup failed:", err); process.exit(1); });
+restorePersistentLobbies().then(() => {
+    const httpServer = app.listen(PORT, () => console.log(`[Catalog] listening ${PORT}`));
+    async function shutdown(signal) {
+        console.log(`[Shutdown] ${signal}: flushing catalog state...`);
+        clearInterval(cleanupTimer);
+        clearInterval(healthTimer);
+        try { await flushPersistentLobbies(); }
+        catch (e) { console.error("[Shutdown] catalog flush failed:", e.message); process.exitCode = 1; }
+        httpServer.close(() => process.exit(process.exitCode || 0));
+        setTimeout(() => { httpServer.closeAllConnections?.(); process.exit(process.exitCode || 0); }, 1500).unref();
+    }
+    process.once("SIGINT", () => shutdown("SIGINT"));
+    process.once("SIGTERM", () => shutdown("SIGTERM"));
+}).catch(err => { console.error("[Persistence] catalog startup failed:", err); process.exit(1); });
