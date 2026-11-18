@@ -1043,18 +1043,21 @@ local function applySnapshotItems(items, onComplete)
         State.applyingSnapshot = true
         local hostIds = {}
         for i, item in ipairs(items or {}) do
-            hostIds[item.id] = true
-            local existing = State.objectMap[item.id]
-            if existing and existing.Parent then
-                applyDelta({kind="update", id=item.id, name=item.name, props=item.props, attrs=item.attrs})
-                local parent
-                if item.parentId == "game" then parent = game
-                elseif type(item.parentId) == "string" and item.parentId:match("^service:") then parent = game:GetService(item.parentId:sub(9))
-                else parent = State.objectMap[item.parentId] end
-                if parent and existing.Parent ~= parent then pcall(function() existing.Parent = parent end) end
-                pcall(function() existing:SetAttribute("_CS_ParentId", item.parentId) end)
-            else
-                applyDelta({kind="create", id=item.id, parentId=item.parentId, className=item.className, name=item.name, props=item.props, attrs=item.attrs})
+            if type(item) == "table" and type(item.id) == "string" and item.id ~= "" then
+                hostIds[item.id] = true
+                local existing = State.objectMap[item.id]
+                if existing then
+                    applyDelta({kind="update", id=item.id, name=item.name, props=item.props, attrs=item.attrs})
+                    local parent
+                    if item.parentId == "game" then parent = game
+                    elseif type(item.parentId) == "string" and item.parentId:match("^service:") then
+                        pcall(function() parent = game:GetService(item.parentId:sub(9)) end)
+                    elseif type(item.parentId) == "string" then parent = State.objectMap[item.parentId] end
+                    if parent and existing.Parent ~= parent then pcall(function() existing.Parent = parent end) end
+                    if type(item.parentId) == "string" then pcall(function() existing:SetAttribute("_CS_ParentId", item.parentId) end) end
+                else
+                    applyDelta({kind="create", id=item.id, parentId=item.parentId, className=item.className, name=item.name, props=item.props, attrs=item.attrs})
+                end
             end
             if i % APPLY_CHUNK == 0 then task.wait(APPLY_CHUNK_DELAY) end
         end
@@ -1983,17 +1986,30 @@ showReviewPrompt = function(snapshotItems, historyItems)
     local people = {}
     for who, count in pairs(byUser) do table.insert(people, who.." ("..count..")") end
     table.sort(people)
+    local details = {}
+    for index, delta in ipairs(historyItems or {}) do
+        if index > 10 then break end
+        local changed = {}
+        if type(delta.props) == "table" then
+            for key in pairs(delta.props) do table.insert(changed, tostring(key)) end
+            table.sort(changed)
+        end
+        local objectLabel = tostring(delta.name or delta.id or "объект")
+        local suffix = #changed > 0 and (" ["..table.concat(changed, ", ", 1, math.min(#changed, 4)).."]") or ""
+        table.insert(details, tostring(delta.userName or delta.userId or "Участник").." · "..tostring(delta.kind or "изменение").." · "..objectLabel..suffix)
+    end
     local description = "Сервер хранит "..tostring(#(snapshotItems or {})).." объектов и "..tostring(#(historyItems or {})).." изменений.\n"
         .. (#parts > 0 and table.concat(parts, " · ") or "Новых событий нет") .. "\n"
         .. (#people > 0 and table.concat(people, ", ") or "Нет участников в журнале")
+        .. (#details > 0 and ("\n\n"..table.concat(details, "\n")) or "")
     local overlay = I("Frame", {Size=UDim2.fromScale(1,1), BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=0.45, BorderSizePixel=0, ZIndex=300}, root)
-    local dialog = I("Frame", {Size=UDim2.fromOffset(500,290), Position=UDim2.fromScale(0.5,0.5), AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=T.surface, BorderSizePixel=0, ZIndex=301}, overlay)
+    local dialog = I("Frame", {Size=UDim2.fromOffset(500,310), Position=UDim2.fromScale(0.5,0.5), AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=T.surface, BorderSizePixel=0, ZIndex=301}, overlay)
     round(dialog, 14); outline(dialog, T.border, 1)
     lbl(dialog, "Изменения, пока вас не было", {font=Enum.Font.GothamBold, textSize=18, size=UDim2.new(1,-40,0,28), pos=UDim2.fromOffset(20,18), zIndex=302})
-    lbl(dialog, description, {textSize=12, color=T.muted, wrapped=true, size=UDim2.new(1,-40,0,110), pos=UDim2.fromOffset(20,58), zIndex=302})
-    lbl(dialog, "Принять — применить серверную версию и новые изменения. Отклонить — оставить вашу текущую сцену и заменить серверную версию ею.", {textSize=11, color=T.text, wrapped=true, size=UDim2.new(1,-40,0,44), pos=UDim2.fromOffset(20,174), zIndex=302})
-    local accept = btn(dialog, "Принять изменения", {size=UDim2.fromOffset(220,38), pos=UDim2.fromOffset(20,232), bg=T.accent, hoverBg=T.accent2, textSize=12, zIndex=303})
-    local reject = btn(dialog, "Отклонить и оставить мою версию", {size=UDim2.new(1,-260,0,38), pos=UDim2.fromOffset(250,232), bg=T.surf2, hoverBg=T.danger, textSize=11, zIndex=303})
+    lbl(dialog, description, {textSize=12, color=T.muted, wrapped=true, size=UDim2.new(1,-40,0,150), pos=UDim2.fromOffset(20,58), zIndex=302})
+    lbl(dialog, "Принять — применить серверную версию и новые изменения. Отклонить — оставить вашу текущую сцену и заменить серверную версию ею.", {textSize=11, color=T.text, wrapped=true, size=UDim2.new(1,-40,0,34), pos=UDim2.fromOffset(20,208), zIndex=302})
+    local accept = btn(dialog, "Принять изменения", {size=UDim2.fromOffset(220,38), pos=UDim2.fromOffset(20,250), bg=T.accent, hoverBg=T.accent2, textSize=12, zIndex=303})
+    local reject = btn(dialog, "Отклонить и оставить мою версию", {size=UDim2.new(1,-260,0,38), pos=UDim2.fromOffset(250,250), bg=T.surf2, hoverBg=T.danger, textSize=11, zIndex=303})
     local busy = false
     accept.MouseButton1Click:Connect(function()
         if busy then return end
