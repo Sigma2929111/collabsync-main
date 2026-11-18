@@ -1254,6 +1254,18 @@ applyDelta = function(delta)
                 local applyVersion = State.remoteApplyVersion[inst]
                 applyProps(inst, delta.props, delta.attrs)
                 if delta.name and inst.Name ~= delta.name then pcall(function() inst.Name = delta.name end) end
+                if type(delta.parentId) == "string" then
+                    local parent = nil
+                    if delta.parentId == "game" then
+                        parent = game
+                    elseif delta.parentId:match("^service:") then
+                        pcall(function() parent = game:GetService(delta.parentId:sub(9)) end)
+                    else
+                        parent = State.objectMap[delta.parentId]
+                    end
+                    if parent and inst.Parent ~= parent then pcall(function() inst.Parent = parent end) end
+                    pcall(function() inst:SetAttribute("_CS_ParentId", delta.parentId) end)
+                end
                 if inst:IsA("MeshPart") and delta.props then
                     applyMeshRobust(inst, delta.props)
                 end
