@@ -330,3 +330,61 @@ test("persistent workspace backup, restore, restart and owner rejoin work end-to
         fs.rmSync(dataDir, {recursive:true, force:true});
     }
 });
+
+
+test("split Server 1 + Server 2 persistent workspace survives both service restarts", async () => {
+    const catalogPort = await freePort();
+    const hostPort = await freePort();
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "collabsync-split-persistent-"));
+    const catalogUrl = "http://127.0.0.1:" + catalogPort;
+    const hostUrl = "http://127.0.0.1:" + hostPort;
+    let catalog, host, hostSocket;
+    try {
+        catalog = await startNodeServer("server 1", catalogPort, dataDir);
+        host = await startNodeServer("server 2", hostPort, dataDir);
+
+        const createResponse = await fetch(catalogUrl + "/api/lobby/create", {
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({name:"Split persistent CI", hostId:140001, hostName:"Split Owner", hostUrl, persistent:true}),
+        });
+        assert.equal(createResponse.status, 200);
+        const created = await createResponse.json();
+        assert.equal(created.persistent, true);
+
+        const firstConnection = await connectWs(hostUrl, created.token);
+        hostSocket = firstConnection.socket;
+        const snapshot = [{id:"split-object", parentId:"service:Workspace", className:"Part", name:"Persisted", props:{Name:"Persisted"}, attrs:{}}];
+        hostSocket.send(JSON.stringify({type:"snapshot", data:snapshot}));
+        await new Promise(resolve => setTimeout(resolve, 450));
+        await new Promise(resolve => hostSocket.close(resolve));
+        hostSocket = null;
+        await stopNodeServer(host);
+        host = null;
+        await stopNodeServer(catalog);
+        catalog = null;
+
+        catalog = await startNodeServer("server 1", catalogPort, dataDir);
+        host = await startNodeServer("server 2", hostPort, dataDir);
+        const listResponse = await fetch(catalogUrl + "/api/lobby/list");
+        assert.equal(listResponse.status, 200);
+        const listed = await listResponse.json();
+        assert.ok(listed.lobbies.some(item => item.id === created.lobbyId && item.persistent === true));
+
+        const ownerJoinResponse = await fetch(catalogUrl + "/api/lobby/join", {
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({lobbyId:created.lobbyId, userId:140001, userName:"Split Owner"}),
+        });
+        assert.equal(ownerJoinResponse.status, 200);
+        const ownerJoin = await ownerJoinResponse.json();
+        const ownerConnection = await connectWs(hostUrl, ownerJoin.token);
+        hostSocket = ownerConnection.socket;
+        assert.equal(ownerConnection.welcome.snapshotSize, 1);
+    } finally {
+        if (hostSocket && hostSocket.readyState !== WebSocket.CLOSED) hostSocket.close();
+        await stopNodeServer(host);
+        await stopNodeServer(catalog);
+        fs.rmSync(dataDir, {recursive:true, force:true});
+    }
+});
