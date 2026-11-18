@@ -481,3 +481,56 @@ test("split Server 1 + Server 2 persistent workspace survives both service resta
         fs.rmSync(dataDir, {recursive:true, force:true});
     }
 });
+
+
+test("Server 2-in-1 enforces member ACL and object claims", async () => {
+    const port = await freePort();
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "collabsync-combined-acl-"));
+    const baseUrl = "http://127.0.0.1:" + port;
+    let server, hostSocket, guestSocket;
+    try {
+        server = await startNodeServer("server 2 in 1", port, dataDir);
+        const createResponse = await fetch(baseUrl + "/api/lobby/create", {
+            method:"POST", headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({name:"Combined ACL CI", hostId:150001, hostName:"Combined Owner", persistent:true}),
+        });
+        assert.equal(createResponse.status, 200);
+        const created = await createResponse.json();
+        hostSocket = (await connectWs(baseUrl, created.token)).socket;
+
+        const joinResponse = await fetch(baseUrl + "/api/lobby/join", {
+            method:"POST", headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({lobbyId:created.lobbyId, userId:150002, userName:"Combined Guest"}),
+        });
+        assert.equal(joinResponse.status, 200);
+        const joined = await joinResponse.json();
+        guestSocket = (await connectWs(baseUrl, joined.token)).socket;
+
+        const denyNotice = waitForMessage(guestSocket, m => m.type === "players" && m.players.some(p => p.userId === 150002 && p.permissions?.edit === false), 4000, "combined ACL deny notice");
+        hostSocket.send(JSON.stringify({type:"permissions_update", targetUserId:150002, permissions:{edit:false, delete:false, move:false, add:false}}));
+        await denyNotice;
+        const denied = waitForMessage(hostSocket, m => m.type === "delta" && m.objectId === "combined-object", 250).then(() => true, () => false);
+        guestSocket.send(JSON.stringify({type:"delta", id:"combined-event-1", objectId:"combined-object", kind:"update", props:{Name:"blocked"}}));
+        assert.equal(await denied, false, "combined server must reject denied property edits");
+
+        const allowNotice = waitForMessage(guestSocket, m => m.type === "players" && m.players.some(p => p.userId === 150002 && p.permissions?.edit === true), 4000, "combined ACL allow notice");
+        hostSocket.send(JSON.stringify({type:"permissions_update", targetUserId:150002, permissions:{edit:true, delete:false, move:false, add:false}}));
+        await allowNotice;
+        const allowed = waitForMessage(hostSocket, m => m.type === "delta" && m.id === "combined-event-2", 4000, "combined allowed edit");
+        guestSocket.send(JSON.stringify({type:"delta", id:"combined-event-2", objectId:"combined-object", kind:"update", props:{Name:"allowed"}}));
+        assert.equal((await allowed).userId, 150002);
+
+        const lockState = waitForMessage(guestSocket, m => m.type === "lock_state" && m.objectId === "combined-object" && m.lock?.userId === 150001, 4000, "combined lock state");
+        hostSocket.send(JSON.stringify({type:"lock_request", objectId:"combined-object"}));
+        await lockState;
+        const conflict = waitForMessage(guestSocket, m => m.type === "lock_conflict" && m.objectId === "combined-object", 4000, "combined lock conflict");
+        guestSocket.send(JSON.stringify({type:"lock_request", objectId:"combined-object"}));
+        await conflict;
+    } finally {
+        for (const socket of [hostSocket, guestSocket]) {
+            if (socket && socket.readyState !== WebSocket.CLOSED) socket.close();
+        }
+        await stopNodeServer(server);
+        fs.rmSync(dataDir, {recursive:true, force:true});
+    }
+});
