@@ -2,6 +2,8 @@ const express = require("express");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 const PORT = process.env.PORT || 3000;
@@ -11,6 +13,33 @@ if (JWT_SECRET.length < 32) throw new Error("JWT_SECRET must be set and contain 
 if (ADMIN_SECRET.length < 32) throw new Error("ADMIN_SECRET must be set and contain at least 32 characters");
 const CATALOG_PUBLIC_URL = process.env.CATALOG_PUBLIC_URL || "";
 const HEARTBEAT_TIMEOUT_MS = 45000;
+const DATA_DIR = process.env.COLLABSYNC_DATA_DIR || path.join(__dirname, ".collabsync-data");
+const STATE_FILE = path.join(DATA_DIR, "catalog-state.json");
+let persistTimer = null, persistQueue = Promise.resolve();
+async function flushPersistentLobbies() {
+    if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+    const state = { version: 1, lobbies: [...lobbies.values()].filter(l => l.persistent) };
+    const data = JSON.stringify(state);
+    persistQueue = persistQueue.catch(() => {}).then(async () => {
+        await fs.promises.mkdir(DATA_DIR, { recursive: true });
+        const tmp = STATE_FILE + ".tmp";
+        await fs.promises.writeFile(tmp, data, { mode: 0o600 });
+        await fs.promises.rename(tmp, STATE_FILE);
+    });
+    await persistQueue;
+}
+function schedulePersist() {
+    if (persistTimer) clearTimeout(persistTimer);
+    persistTimer = setTimeout(() => { persistTimer = null; flushPersistentLobbies().catch(e => console.error("[Persistence] catalog save failed:", e.message)); }, 250);
+}
+async function restorePersistentLobbies() {
+    try {
+        const state = JSON.parse(await fs.promises.readFile(STATE_FILE, "utf8"));
+        if (state.version !== 1 || !Array.isArray(state.lobbies)) throw new Error("unsupported catalog state format");
+        for (const lobby of state.lobbies) if (lobby && typeof lobby.id === "string" && lobby.persistent === true && Number.isSafeInteger(Number(lobby.hostId))) lobbies.set(lobby.id, lobby);
+        console.log(`[Persistence] restored ${lobbies.size} persistent catalog lobbies`);
+    } catch (e) { if (e.code !== "ENOENT") console.error("[Persistence] catalog restore failed:", e.message); }
+}
 
 // Тестеры получают режим просмотра; специальные декоративные роли удалены.
 const TESTER_IDS = new Set((process.env.TESTER_IDS || "").split(",").map(s=>s.trim()).filter(Boolean));
@@ -53,18 +82,19 @@ app.use((req, res, next) => {
 setInterval(() => {
     const t = now();
     for (const [id, l] of lobbies.entries()) {
-        if (t - l.lastPing > HEARTBEAT_TIMEOUT_MS) { 
+        if (!l.persistent && t - l.lastPing > HEARTBEAT_TIMEOUT_MS) { 
             lobbies.delete(id); 
             console.log(`[cleanup] lobby ${id} expired`); 
         }
     }
+    schedulePersist();
 }, 15000);
 
 app.get("/health", (req, res) => res.json({ ok: true, ts: now(), lobbies: lobbies.size }));
 
 app.post("/api/lobby/create", async (req, res) => {
     try {
-        const { name, hostId, hostName, password, isPrivate, hostUrl, placeId, placeName } = req.body || {};
+        const { name, hostId, hostName, password, isPrivate, hostUrl, placeId, placeName, persistent } = req.body || {};
         const hostUid = Number(hostId);
         if (!name || !Number.isSafeInteger(hostUid) || hostUid <= 0) return res.status(400).json({ error: "valid name and hostId required" });
         if (String(name).length > 100) return res.status(400).json({ error: "name too long" });
@@ -81,13 +111,14 @@ app.post("/api/lobby/create", async (req, res) => {
             hostId: hostUid, hostName: String(hostName || hostUid).slice(0, 32),
             passwordHash, isPrivate: !!isPrivate,
             hostUrl: hostUrl || null, placeId: placeId || null, placeName: placeName || null,
-            createdAt: now(), lastPing: now(),
+            createdAt: now(), lastPing: now(), persistent: persistent === true,
         };
         lobbies.set(lobbyId, lobby);
+        schedulePersist();
         
         // JWT строго содержит isHost: true только для создателя
         const token = jwt.sign({ 
-            lobbyId, userId: lobby.hostId, userName: lobby.hostName, isHost: true, isTester: false, lobbyName: lobby.name 
+            lobbyId, userId: lobby.hostId, userName: lobby.hostName, isHost: true, isTester: false, lobbyName: lobby.name, persistent: lobby.persistent === true 
         }, JWT_SECRET, { expiresIn: "12h" });
         
         res.json({ lobbyId, token, hostUrl: lobby.hostUrl });
@@ -111,14 +142,14 @@ app.post("/api/lobby/join", async (req, res) => {
         if (!ok) return res.status(403).json({ error: "invalid password" });
     }
     
-    if (now() - lobby.lastPing > HEARTBEAT_TIMEOUT_MS) {
+    if (!lobby.persistent && now() - lobby.lastPing > HEARTBEAT_TIMEOUT_MS) {
         lobbies.delete(lobbyId);
         return res.status(410).json({ error: "lobby expired" });
     }
     
     // JWT для гостя строго содержит isHost: false
     const token = jwt.sign({ 
-        lobbyId, userId: uid, userName: safeName, isHost: false, isTester: roles.isTester, lobbyName: lobby.name 
+        lobbyId, userId: uid, userName: safeName, isHost: false, isTester: roles.isTester, lobbyName: lobby.name, persistent: lobby.persistent === true 
     }, JWT_SECRET, { expiresIn: "12h" });
     
     res.json({ token, hostUrl: lobby.hostUrl, lobbyId, lobbyName: lobby.name, hostName: lobby.hostName });
@@ -133,7 +164,7 @@ app.get("/api/lobby/list", (req, res) => {
         list.push({
             id: l.id, name: l.name, hostName: l.hostName, hostId: l.hostId,
             hasPassword: !!l.passwordHash, placeName: l.placeName, placeId: l.placeId,
-            hostUrl: l.hostUrl, createdAt: l.createdAt,
+            hostUrl: l.hostUrl, createdAt: l.createdAt, persistent: l.persistent === true,
         });
     }
     list.sort((a, b) => b.createdAt - a.createdAt);
@@ -154,6 +185,7 @@ app.post("/api/lobby/heartbeat", (req, res) => {
         return res.status(403).json({ error: "forbidden" });
     }
     lobby.lastPing = now();
+    schedulePersist();
     res.json({ ok: true });
 });
 
@@ -171,6 +203,7 @@ app.post("/api/lobby/delete", (req, res) => {
         return res.status(403).json({ error: "forbidden" });
     }
     lobbies.delete(lobbyId);
+    schedulePersist();
     res.json({ ok: true });
 });
 
@@ -216,4 +249,4 @@ setInterval(() => {
     fetch(url).catch(()=>{});
 }, 10000);
 
-app.listen(PORT, () => console.log(`[Catalog] listening ${PORT}`));
+restorePersistentLobbies().then(() => app.listen(PORT, () => console.log(`[Catalog] listening ${PORT}`))).catch(err => { console.error("[Persistence] catalog startup failed:", err); process.exit(1); });
