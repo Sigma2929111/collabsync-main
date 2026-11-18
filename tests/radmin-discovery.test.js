@@ -237,6 +237,42 @@ test("Server 1 and Server 2 support a real two-client collaboration session", as
         const allowed = await acceptedDelta;
         assert.equal(allowed.userId, 120002);
 
+        // A participant cannot grant themselves permissions by sending the owner-only control message.
+        guestSocket.send(JSON.stringify({
+            type:"permissions_update", targetUserId:120002,
+            permissions:{edit:true, delete:true, move:true, add:true},
+        }));
+        const deniedKinds = [
+            {id:"acl-delete-denied", kind:"delete"},
+            {id:"acl-move-denied", kind:"update", props:{Position:{x:1,y:2,z:3}}},
+            {id:"acl-create-denied", kind:"create", className:"Part", parentId:"service:Workspace", props:{Name:"blocked"}},
+        ];
+        for (const candidate of deniedKinds) {
+            const leaked = waitForMessage(hostSocket, message => message.type === "delta" && message.id === candidate.id, 250)
+                .then(() => true, () => false);
+            guestSocket.send(JSON.stringify({type:"delta", ...candidate}));
+            assert.equal(await leaked, false, "server must enforce delete/move/add permissions and ignore guest permission escalation");
+        }
+
+        const grantRemaining = waitForMessage(guestSocket, message =>
+            message.type === "players" && message.players.some(p => p.userId === 120002 &&
+                p.permissions?.delete === true && p.permissions?.move === true && p.permissions?.add === true)
+        , 4000, "grant remaining permissions");
+        hostSocket.send(JSON.stringify({
+            type:"permissions_update", targetUserId:120002,
+            permissions:{edit:true, delete:true, move:true, add:true},
+        }));
+        await grantRemaining;
+        for (const candidate of [
+            {id:"acl-move-allowed", kind:"update", props:{Position:{x:4,y:5,z:6}}},
+            {id:"acl-delete-allowed", kind:"delete"},
+            {id:"acl-create-allowed", kind:"create", className:"Part", parentId:"service:Workspace", props:{Name:"allowed"}},
+        ]) {
+            const received = waitForMessage(hostSocket, message => message.type === "delta" && message.id === candidate.id, 4000, "permitted "+candidate.kind+" delta");
+            guestSocket.send(JSON.stringify({type:"delta", ...candidate}));
+            assert.equal((await received).userId, 120002);
+        }
+
         const hostLock = waitForMessage(guestSocket, message => message.type === "lock_state" && message.objectId === "locked-edit" && message.lock?.userId === 120001, 4000, "host object lock broadcast");
         hostSocket.send(JSON.stringify({type:"lock_request", objectId:"locked-edit"}));
         await hostLock;
