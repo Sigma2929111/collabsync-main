@@ -422,6 +422,7 @@ test("split Server 1 + Server 2 persistent workspace survives both service resta
         assert.equal(backupCreateBeforeRestart.status, 200);
         const persistedBackup = await backupCreateBeforeRestart.json();
         hostSocket.send(JSON.stringify({type:"delta", id:"split-history-event", objectId:"split-object", kind:"update", props:{Name:"Changed before restart"}}));
+        hostSocket.send(JSON.stringify({type:"snapshot", data:[{...snapshot[0], name:"Changed after backup", props:{Name:"Changed after backup"}}]}));
         await new Promise(resolve => setTimeout(resolve, 450));
         await new Promise(resolve => { hostSocket.once("close", resolve); hostSocket.close(); });
         hostSocket = null;
@@ -452,10 +453,18 @@ test("split Server 1 + Server 2 persistent workspace survives both service resta
         hostSocket = ownerConnection.socket;
         assert.equal(ownerConnection.welcome.snapshotSize, 1);
         const backupHeadersAfterRestart = {"Content-Type":"application/json", "Authorization":"Bearer "+ownerJoin.token};
+        const restoreResponse = await fetch(hostUrl + "/api/workspace/backups/restore", {
+            method:"POST", headers:backupHeadersAfterRestart,
+            body:JSON.stringify({lobbyId:created.lobbyId, backupId:persistedBackup.backup.id}),
+        });
+        assert.equal(restoreResponse.status, 200);
+        const restored = await restoreResponse.json();
+        assert.equal(restored.snapshotSize, 1);
         const backupListResponse = await fetch(hostUrl + "/api/workspace/"+created.lobbyId+"/backups", {headers:backupHeadersAfterRestart});
         assert.equal(backupListResponse.status, 200);
         const splitBackupList = await backupListResponse.json();
         assert.ok(splitBackupList.backups.some(item => item.id === persistedBackup.backup.id), "backup must survive Server 2 restart");
+        assert.ok(splitBackupList.backups.some(item => item.reason === "pre-restore"), "restore must create a safety backup before replacing the snapshot");
         const activityResponse = await fetch(hostUrl + "/api/workspace/"+created.lobbyId+"/activity", {headers:backupHeadersAfterRestart});
         assert.equal(activityResponse.status, 200);
         const splitActivity = await activityResponse.json();
