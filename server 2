@@ -234,7 +234,7 @@ wss.on("connection", (ws) => {
                 room.snapshot = msg.data;
                 room.history = [];
                 if (room.persistent) schedulePersist();
-                console.log/(`[Snapshot] ${lobbyId}: ${room.snapshot.length} items`);
+                console.log(`[Snapshot] ${lobbyId}: ${room.snapshot.length} items`);
             }
             return;
         }
