@@ -1805,10 +1805,21 @@ local permRow = function(uid, name, defaults, isHostRow)
         lbl(chip, pname, {textSize=10, xAlign=Enum.TextXAlignment.Center, color=on and Color3.new(1,1,1) or T.muted, size=UDim2.fromScale(1,1)})
         local cb = I("TextButton", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text="", ZIndex=5}, chip)
         local isOn = on
+        local selected = {true, true, true, true}
+        for index = 1, 4 do selected[index] = (defaults and defaults[index]) == true end
+        cb.Active = isOwnLobby and not isHostRow
         cb.MouseButton1Click:Connect(function()
+            if not isOwnLobby or isHostRow then return end
             isOn = not isOn
+            selected[i] = isOn
             chip.BackgroundColor3 = isOn and T.success or T.surf3
             chip:FindFirstChildOfClass("TextLabel").TextColor3 = isOn and Color3.new(1,1,1) or T.muted
+            if State.wsClient and State.connected then
+                local permissions = {edit=selected[1], delete=selected[2], move=selected[3], add=selected[4]}
+                pcall(function()
+                    State.wsClient:Send(HttpService:JSONEncode({type="permissions_update", targetUserId=uid, permissions=permissions}))
+                end)
+            end
         end)
     end
 end
@@ -1820,7 +1831,8 @@ refreshPerms = function()
     if #players == 0 then players = {{userId=MY_ID, userName=MY_NAME, isHost=isOwnLobby, roles=MY_ROLES}} end
     for _, p in ipairs(players) do
         local isHostRow = p.isHost or isLobbyHost(p.userId)
-        permRow(p.userId, formatName(p.userId), {true, true, true, true}, isHostRow)
+        local permissions = p.permissions or {edit=true, delete=true, move=true, add=true}
+        permRow(p.userId, formatName(p.userId), {permissions.edit == true, permissions.delete == true, permissions.move == true, permissions.add == true}, isHostRow)
     end
 end
 
