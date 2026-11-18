@@ -1797,16 +1797,16 @@ local permRow = function(uid, name, defaults, isHostRow)
     
     local cbox = I("Frame", {Size=UDim2.new(0,270,1,0), Position=UDim2.new(1,-270,0,0), BackgroundTransparency=1}, r)
     I("UIListLayout", {FillDirection=Enum.FillDirection.Horizontal, Padding=UDim.new(0,6), VerticalAlignment=Enum.VerticalAlignment.Center, HorizontalAlignment=Enum.HorizontalAlignment.Right}, cbox)
+    local selected = {true, true, true, true}
+    for index = 1, 4 do selected[index] = (defaults and defaults[index]) == true end
     
     for i, pname in ipairs(permNames) do
-        local on = (defaults and defaults[i]) or false
+        local on = selected[i]
         local chip = I("Frame", {Size=UDim2.fromOffset(62,26), BackgroundColor3=on and T.success or T.surf3, BorderSizePixel=0}, cbox)
         round(chip, 6)
         lbl(chip, pname, {textSize=10, xAlign=Enum.TextXAlignment.Center, color=on and Color3.new(1,1,1) or T.muted, size=UDim2.fromScale(1,1)})
         local cb = I("TextButton", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, Text="", ZIndex=5}, chip)
         local isOn = on
-        local selected = {true, true, true, true}
-        for index = 1, 4 do selected[index] = (defaults and defaults[index]) == true end
         cb.Active = isOwnLobby and not isHostRow
         cb.MouseButton1Click:Connect(function()
             if not isOwnLobby or isHostRow then return end
