@@ -122,7 +122,7 @@ app.post("/api/lobby/create", async (req, res) => {
             passwordHash, isPrivate: !!isPrivate,
             hostUrl, placeId: placeId || null, placeName: placeName || null,
             createdAt: now(), lastPing: now(), persistent: req.body?.persistent === true,
-            backupSettings: { enabled: false, intervalMs: 86400000, retention: 20 }, backups: [],
+            backupSettings: { enabled: false, intervalMs: 86400000, retention: 20 }, backups: [], activity: [],
         });
         schedulePersist();
 
@@ -228,6 +228,11 @@ function ownerForWorkspace(req, res) {
         return lobby;
     } catch (_) { res.status(401).json({ error: "unauthorized" }); return null; }
 }
+app.get("/api/workspace/:lobbyId/activity", (req, res) => {
+    const l = ownerForWorkspace(req, res); if (!l) return;
+    if (!l.persistent) return res.status(409).json({ error: "activity log is available for persistent workspaces only" });
+    res.json({ activity: (l.activity || []).slice(-50) });
+});
 app.get("/api/workspace/:lobbyId/backups", (req, res) => {
     const l = ownerForWorkspace(req, res); if (!l) return;
     res.json({ settings: l.backupSettings, backups: (l.backups || []).map(({id, createdAt, reason, snapshotSize}) => ({id, createdAt, reason, snapshotSize})) });
@@ -490,7 +495,16 @@ wss.on("connection", (ws) => {
             if (msg.kind !== "camera") {
                 room.history.push(trustedDelta);
                 if (room.history.length > MAX_HISTORY) room.history.shift();
-                if (lobbies.get(lobbyId)?.persistent) schedulePersist();
+                const persistentWorkspace = lobbies.get(lobbyId);
+                if (persistentWorkspace?.persistent) {
+                    const activityItem = {
+                        id: msg.id, kind: msg.kind, userId: clientInfo.userId,
+                        userName: clientInfo.userName, ts: now(),
+                        objectName: typeof msg.name === "string" ? msg.name.slice(0, 100) : null,
+                    };
+                    persistentWorkspace.activity = [...(persistentWorkspace.activity || []), activityItem].slice(-500);
+                    schedulePersist();
+                }
             }
             broadcast(room, trustedDelta, ws);
             return;
