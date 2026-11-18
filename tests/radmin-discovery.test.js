@@ -123,7 +123,7 @@ function waitForMessage(socket, predicate, timeoutMs = 4000, label = "matching m
     });
 }
 
-async function startNodeServer(script, port, dataDir) {
+async function startNodeServer(script, port, dataDir, extraEnv = {}) {
     const child = spawn(process.execPath, [path.join(root, script)], {
         cwd: root,
         env: {
@@ -134,6 +134,7 @@ async function startNodeServer(script, port, dataDir) {
             CATALOG_PUBLIC_URL: "",
             HOST_PUBLIC_URL: "",
             COLLABSYNC_DATA_DIR: dataDir,
+            ...extraEnv,
         },
         stdio: "ignore",
     });
@@ -539,9 +540,9 @@ test("Server 2-in-1 enforces member ACL and object claims", async () => {
     const port = await freePort();
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "collabsync-combined-acl-"));
     const baseUrl = "http://127.0.0.1:" + port;
-    let server, hostSocket, guestSocket;
+    let server, hostSocket, guestSocket, testerSocket;
     try {
-        server = await startNodeServer("server 2 in 1", port, dataDir);
+        server = await startNodeServer("server 2 in 1", port, dataDir, {TESTER_IDS:"150003"});
         const createResponse = await fetch(baseUrl + "/api/lobby/create", {
             method:"POST", headers:{"Content-Type":"application/json"},
             body:JSON.stringify({name:"Combined ACL CI", hostId:150001, hostName:"Combined Owner", persistent:true}),
@@ -557,6 +558,20 @@ test("Server 2-in-1 enforces member ACL and object claims", async () => {
         assert.equal(joinResponse.status, 200);
         const joined = await joinResponse.json();
         guestSocket = (await connectWs(baseUrl, joined.token)).socket;
+
+        const testerJoinResponse = await fetch(baseUrl + "/api/lobby/join", {
+            method:"POST", headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({lobbyId:created.lobbyId, userId:150003, userName:"Read Only Tester"}),
+        });
+        assert.equal(testerJoinResponse.status, 200);
+        const testerJoined = await testerJoinResponse.json();
+        testerSocket = (await connectWs(baseUrl, testerJoined.token)).socket;
+        const testerEdit = waitForMessage(hostSocket, m => m.type === "delta" && m.id === "tester-edit", 250).then(() => true, () => false);
+        testerSocket.send(JSON.stringify({type:"delta", id:"tester-edit", kind:"update", props:{Name:"must remain read only"}}));
+        assert.equal(await testerEdit, false, "tester must not edit the shared workspace");
+        const testerLock = waitForMessage(hostSocket, m => m.type === "lock_state" && m.objectId === "tester-object", 250).then(() => true, () => false);
+        testerSocket.send(JSON.stringify({type:"lock_request", objectId:"tester-object"}));
+        assert.equal(await testerLock, false, "tester must not claim editable object locks");
 
         const denyNotice = waitForMessage(guestSocket, m => m.type === "players" && m.players.some(p => p.userId === 150002 && p.permissions?.edit === false), 4000, "combined ACL deny notice");
         hostSocket.send(JSON.stringify({type:"permissions_update", targetUserId:150002, permissions:{edit:false, delete:false, move:false, add:false}}));
@@ -587,7 +602,7 @@ test("Server 2-in-1 enforces member ACL and object claims", async () => {
         await releasedOnDisconnect;
         guestSocket = null;
     } finally {
-        for (const socket of [hostSocket, guestSocket]) {
+        for (const socket of [hostSocket, guestSocket, testerSocket]) {
             if (socket && socket.readyState !== WebSocket.CLOSED) socket.close();
         }
         await stopNodeServer(server);
