@@ -356,6 +356,15 @@ setInterval(() => {
 setInterval(() => {
     const t = Date.now();
     for (const [lobbyId, room] of rooms.entries()) {
+
+        if (room.locks) {
+            for (const [objectId, lock] of room.locks.entries()) {
+                if (lock.expiresAt <= now) {
+                    room.locks.delete(objectId);
+                    broadcast(room, {type:"lock_state", objectId, lock:null});
+                }
+            }
+        }
         if (lobbies.get(lobbyId)?.persistent) continue;
         if (!room.hostUserId) continue;
         let hostOnline = false;
