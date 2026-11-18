@@ -2012,7 +2012,8 @@ showReviewPrompt = function(snapshotItems, historyItems)
         local localItem = localById[delta.id]
         local changes = {}
         for key, value in pairs(type(delta.props) == "table" and delta.props or {}) do
-            local before = localItem and localItem.props and localItem.props[key] or nil
+            local before = nil
+            if localItem and type(localItem.props) == "table" then before = localItem.props[key] end
             if shortValue(before) ~= shortValue(value) then
                 table.insert(changes, tostring(key)..": "..shortValue(before).." → "..shortValue(value))
             end
@@ -2044,17 +2045,19 @@ showReviewPrompt = function(snapshotItems, historyItems)
         for index, check in ipairs(rowChecks) do check.Text = selected[index] and "✓" or "□" end
     end
     for index, delta in ipairs(reviewDeltas) do
+        local rowIndex = index
+        local rowDelta = delta
         local row = I("Frame", {Size=UDim2.new(1,-4,0,58), BackgroundColor3=T.surface, BorderSizePixel=0, LayoutOrder=index, ZIndex=303}, list)
         round(row, 7)
         local check = btn(row, "✓", {size=UDim2.fromOffset(34,34), pos=UDim2.fromOffset(8,12), bg=T.success, hoverBg=T.accent, textSize=14, zIndex=304})
         rowChecks[index] = check
         check.MouseButton1Click:Connect(function()
-            selected[index] = not selected[index]
-            check.Text = selected[index] and "✓" or "□"
-            check.BackgroundColor3 = selected[index] and T.success or T.surf3
+            selected[rowIndex] = not selected[rowIndex]
+            check.Text = selected[rowIndex] and "✓" or "□"
+            check.BackgroundColor3 = selected[rowIndex] and T.success or T.surf3
             updateCount()
         end)
-        lbl(row, describeDelta(delta), {textSize=10, color=T.text, wrapped=true, size=UDim2.new(1,-58,1,-8), pos=UDim2.fromOffset(50,4), zIndex=304})
+        lbl(row, describeDelta(rowDelta), {textSize=10, color=T.text, wrapped=true, size=UDim2.new(1,-58,1,-8), pos=UDim2.fromOffset(50,4), zIndex=304})
     end
     if #reviewDeltas == 0 then
         lbl(list, "Новых изменений для выборочного применения нет. При принятии будет использован серверный snapshot только если локальная сцена пуста.", {textSize=11, color=T.muted, wrapped=true, size=UDim2.new(1,-20,0,48), pos=UDim2.fromOffset(8,8), zIndex=304})
