@@ -2324,7 +2324,7 @@ stopSession = function()
 end
 
 exitLobbyUI = function()
-    if State.session and State.session.isHost then
+    if State.session and State.session.isHost and not State.session.persistent then
         if State.session.token then
             pcall(function()
                 httpJson(CATALOG_URL.."/api/lobby/delete", "POST", {lobbyId=State.session.lobbyId}, {
@@ -2393,9 +2393,10 @@ attemptJoin = function(lobbyId, password, hostName)
             lobbyId = res.lobbyId,
             token = res.token,
             hostUrl = res.hostUrl,
-            isHost = false
+            isHost = res.isHost == true,
+            persistent = res.persistent == true
         }
-        isOwnLobby = false
+        isOwnLobby = res.isHost == true
         currentLobby = {
             id = res.lobbyId,
             hostId = res.hostId or 0,
@@ -2408,7 +2409,7 @@ attemptJoin = function(lobbyId, password, hostName)
             {label = "Подключение к серверу...", fn = function()
                 local ready = false
                 local err = nil
-                connectWebSocket(State.session.hostUrl, State.session.token, false, 
+                connectWebSocket(State.session.hostUrl, State.session.token, State.session.isHost, 
                     function() ready = true end, 
                     function(e) err = e end
                 )
@@ -2422,7 +2423,7 @@ attemptJoin = function(lobbyId, password, hostName)
             Main.Visible = false
             InPlace.Visible = true
             lastVisibleFrame = InPlace
-            ipStatusLbl.Text = "● Активно (Гость)"
+            ipStatusLbl.Text = State.session.isHost and "● Активно (Владелец)" or "● Активно (Гость)"
             ipSubtitleLbl.Text = (res.hostName or hostName or "?") .. " | " .. (res.lobbyId or "?")
             startHeartbeat()
             showToast(InPlace, "Вы в лобби!", T.success)
@@ -2461,7 +2462,8 @@ publishLobby = function()
             lobbyId = res.lobbyId,
             token = res.token,
             hostUrl = res.hostUrl or hostUrl,
-            isHost = true
+            isHost = true,
+            persistent = res.persistent == true
         }
         isOwnLobby = true
         currentLobby = {
