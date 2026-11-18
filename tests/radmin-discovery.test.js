@@ -589,10 +589,14 @@ test("Server 2-in-1 enforces member ACL and object claims", async () => {
         const testerJoined = await testerJoinResponse.json();
         testerSocket = (await connectWs(baseUrl, testerJoined.token)).socket;
         const testerEdit = waitForMessage(hostSocket, m => m.type === "delta" && m.id === "tester-edit", 250).then(() => true, () => false);
+        const testerEditNotice = waitForMessage(testerSocket, m => m.type === "permission_denied" && m.action === "update", 4000, "tester edit denial notice");
         testerSocket.send(JSON.stringify({type:"delta", id:"tester-edit", kind:"update", props:{Name:"must remain read only"}}));
+        await testerEditNotice;
         assert.equal(await testerEdit, false, "tester must not edit the shared workspace");
         const testerLock = waitForMessage(hostSocket, m => m.type === "lock_state" && m.objectId === "tester-object", 250).then(() => true, () => false);
+        const testerLockNotice = waitForMessage(testerSocket, m => m.type === "permission_denied" && m.action === "lock", 4000, "tester lock denial notice");
         testerSocket.send(JSON.stringify({type:"lock_request", objectId:"tester-object"}));
+        await testerLockNotice;
         assert.equal(await testerLock, false, "tester must not claim editable object locks");
 
         const denyNotice = waitForMessage(guestSocket, m => m.type === "players" && m.players.some(p => p.userId === 150002 && p.permissions?.edit === false), 4000, "combined ACL deny notice");
